@@ -211,56 +211,128 @@ fn apply_panel_width(mut panel: El, view: &PanelView) -> El {
 }
 
 fn module_chip(module: &ModuleSnapshot) -> El {
-    let status = status_badge(module.status);
-    let value = match &module.value {
-        ModuleValue::Text(value) => text(ellipsize(value, 32)).label(),
-        ModuleValue::Percent(frac) => text(format!("{:.0}%", frac * 100.0)).label(),
-        ModuleValue::Count { current, total } => match total {
-            Some(total) => text(format!("{current}/{total}")).label(),
-            None => text(current.to_string()).label(),
-        },
+    let mut cells = vec![text(ellipsize(&module.title, 22)).caption().muted()];
+    match &module.value {
         ModuleValue::State { label, detail } => {
-            let mut cells = vec![text(ellipsize(label, 24)).label()];
+            cells.push(status_badge_with_label(module.status, ellipsize(label, 20)));
             if let Some(detail) = detail {
-                cells.push(text(ellipsize(detail, 24)).caption().muted());
+                cells.push(text(ellipsize(detail, 28)).caption().muted());
             }
-            row(cells).gap(tokens::SPACE_1).align(Align::Center)
         }
+        _ => {
+            cells.push(module_value_text(module).label());
+            if !matches!(module.status, ModuleStatus::Ok) {
+                cells.push(status_badge(module.status));
+            }
+        }
+    }
+
+    let content = row(cells).gap(tokens::SPACE_1).align(Align::Center);
+    let chip = if let Some(fraction) = module_fraction(module) {
+        column([
+            content,
+            progress_with_color(fraction, status_color(module.status))
+                .height(Size::Fixed(3.0))
+                .width(Size::Fill(1.0)),
+        ])
+        .gap(2.0)
+        .align(Align::Stretch)
+    } else {
+        content
     };
-    row([
-        status,
-        text(ellipsize(&module.title, 28)).caption().muted(),
-        value,
-    ])
-    .gap(tokens::SPACE_1)
-    .align(Align::Center)
-    .padding(Sides::x(tokens::SPACE_2))
-    .radius(tokens::RADIUS_SM)
+
+    chip.padding(Sides::xy(tokens::SPACE_2, tokens::SPACE_1))
+        .fill(tokens::MUTED.with_alpha_u8(36))
+        .stroke(tokens::BORDER.with_alpha_u8(90))
+        .radius(tokens::RADIUS_MD)
 }
 
 fn sidebar_module_item(module: &ModuleSnapshot) -> El {
+    let mut content = vec![row([
+        text(ellipsize(&module.title, 30)).label(),
+        spacer(),
+        module_value_summary(module),
+    ])
+    .gap(tokens::SPACE_2)
+    .align(Align::Center)];
+    if let Some(detail) = module_detail_text(module) {
+        content.push(text(detail).caption().muted());
+    }
+    if let Some(fraction) = module_fraction(module) {
+        content.push(
+            progress_with_color(fraction, status_color(module.status))
+                .height(Size::Fixed(5.0))
+                .width(Size::Fill(1.0)),
+        );
+    }
+
     item([
-        item_content([
-            item_title(ellipsize(&module.title, 30)),
-            item_description(module_description(module)),
-        ]),
+        item_content(content).gap(tokens::SPACE_1),
         item_actions([status_badge(module.status)]),
     ])
 }
 
-fn module_description(module: &ModuleSnapshot) -> String {
+fn module_value_text(module: &ModuleSnapshot) -> El {
+    text(module_value_plain(module))
+}
+
+fn module_value_summary(module: &ModuleSnapshot) -> El {
     match &module.value {
-        ModuleValue::Text(value) => ellipsize(value, 48),
+        ModuleValue::State { label, .. } => {
+            status_badge_with_label(module.status, ellipsize(label, 24))
+        }
+        _ => text(module_value_plain(module)).label(),
+    }
+}
+
+fn module_value_plain(module: &ModuleSnapshot) -> String {
+    match &module.value {
+        ModuleValue::Text(value) => ellipsize(value, 36),
         ModuleValue::Percent(frac) => format!("{:.0}%", frac * 100.0),
         ModuleValue::Count { current, total } => match total {
             Some(total) => format!("{current}/{total}"),
             None => current.to_string(),
         },
-        ModuleValue::State { label, detail } => match detail {
-            Some(detail) => format!("{} - {}", ellipsize(label, 24), ellipsize(detail, 24)),
-            None => ellipsize(label, 48),
-        },
+        ModuleValue::State { label, .. } => ellipsize(label, 36),
     }
+}
+
+fn module_detail_text(module: &ModuleSnapshot) -> Option<String> {
+    match &module.value {
+        ModuleValue::State {
+            detail: Some(detail),
+            ..
+        } => Some(ellipsize(detail, 56)),
+        _ => None,
+    }
+}
+
+fn module_fraction(module: &ModuleSnapshot) -> Option<f32> {
+    match &module.value {
+        ModuleValue::Percent(frac) => Some(frac.clamp(0.0, 1.0)),
+        ModuleValue::Count {
+            current,
+            total: Some(total),
+        } if *total > 0 => Some((*current as f32 / *total as f32).clamp(0.0, 1.0)),
+        ModuleValue::State { label, detail } => percent_in_text(label)
+            .or_else(|| detail.as_deref().and_then(percent_in_text))
+            .map(|percent| (percent / 100.0).clamp(0.0, 1.0)),
+        _ => None,
+    }
+}
+
+fn percent_in_text(value: &str) -> Option<f32> {
+    let percent_index = value.find('%')?;
+    let prefix = &value[..percent_index];
+    let number = prefix
+        .chars()
+        .rev()
+        .take_while(|ch| ch.is_ascii_digit() || *ch == '.')
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<String>();
+    number.parse().ok()
 }
 
 fn ellipsize(value: &str, max_chars: usize) -> String {
@@ -288,18 +360,64 @@ fn ellipsize(value: &str, max_chars: usize) -> String {
 }
 
 fn status_badge(status: ModuleStatus) -> El {
-    let label = match status {
-        ModuleStatus::Ok => "ok",
-        ModuleStatus::Info => "info",
-        ModuleStatus::Warning => "warn",
-        ModuleStatus::Critical => "crit",
-        ModuleStatus::Unknown => "idle",
-    };
+    status_badge_with_label(
+        status,
+        match status {
+            ModuleStatus::Ok => "ok",
+            ModuleStatus::Info => "info",
+            ModuleStatus::Warning => "warn",
+            ModuleStatus::Critical => "crit",
+            ModuleStatus::Unknown => "idle",
+        },
+    )
+}
+
+fn status_badge_with_label(status: ModuleStatus, label: impl Into<String>) -> El {
+    let badge = badge(label);
     match status {
-        ModuleStatus::Ok => badge(label).success(),
-        ModuleStatus::Info => badge(label).info(),
-        ModuleStatus::Warning => badge(label).warning(),
-        ModuleStatus::Critical => badge(label).destructive(),
-        ModuleStatus::Unknown => badge(label).muted(),
+        ModuleStatus::Ok => badge.success(),
+        ModuleStatus::Info => badge.info(),
+        ModuleStatus::Warning => badge.warning(),
+        ModuleStatus::Critical => badge.destructive(),
+        ModuleStatus::Unknown => badge.muted(),
+    }
+}
+
+fn status_color(status: ModuleStatus) -> Color {
+    match status {
+        ModuleStatus::Ok => tokens::SUCCESS,
+        ModuleStatus::Info => tokens::INFO,
+        ModuleStatus::Warning => tokens::WARNING,
+        ModuleStatus::Critical => tokens::DESTRUCTIVE,
+        ModuleStatus::Unknown => tokens::MUTED_FOREGROUND,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extracts_percent_from_usage_labels() {
+        assert_eq!(percent_in_text("5h 18%"), Some(18.0));
+        assert_eq!(percent_in_text("7d 7% - pro"), Some(7.0));
+        assert_eq!(percent_in_text("idle"), None);
+    }
+
+    #[test]
+    fn derives_module_fraction_from_state_detail() {
+        let module = ModuleSnapshot {
+            id: "usage".into(),
+            title: "codex".into(),
+            value: ModuleValue::State {
+                label: "usage".into(),
+                detail: Some("7d 42% - pro".into()),
+            },
+            status: ModuleStatus::Ok,
+            updated_at: None,
+            stale_after: None,
+        };
+
+        assert_eq!(module_fraction(&module), Some(0.42));
     }
 }
