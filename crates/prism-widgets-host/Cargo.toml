@@ -16,6 +16,7 @@ pollster.workspace = true
 prism-widgets-core.workspace = true
 prism-widgets-ui.workspace = true
 raw-window-handle.workspace = true
+rustix.workspace = true
 smithay-client-toolkit.workspace = true
 tracing.workspace = true
 wayland-backend.workspace = true

@@ -48,6 +48,13 @@ The layer-shell host only reserves and positions the band. Inside that band,
 the UI is a Damascene widget cluster built from stock `card`, `toolbar`,
 `item`, and status widgets rather than a manually painted bar.
 
+Sidebar panel header text is hidden by default; set `show-header true` on a
+panel if you want the panel id displayed above its modules.
+
+When running as a layer-shell panel, `prism-widgets` watches the config file's
+parent directory and reloads the panel configuration after changes. Invalid
+reloads are logged and the current running configuration is kept.
+
 Omit a panel's `output` node to show it on every output. Set `output "DP-1"`
 or the relevant connector name for panels that should only appear on tertiary
 displays.

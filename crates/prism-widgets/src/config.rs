@@ -43,6 +43,8 @@ struct PanelNode {
     radius: u32,
     #[knuffel(child, unwrap(argument), default = true)]
     border: bool,
+    #[knuffel(child, unwrap(argument), default = false)]
+    show_header: bool,
     #[knuffel(child, unwrap(argument, str), default = ThemeConfigName::Dark)]
     theme: ThemeConfigName,
     #[knuffel(child)]
@@ -323,6 +325,7 @@ impl Default for Config {
                 opacity: 0.82,
                 radius: 12,
                 border: true,
+                show_header: false,
                 theme: ThemeConfigName::Dark,
                 modules: ModulesNode {
                     list: vec![ModuleNode::Clock(ClockNode {
@@ -367,6 +370,7 @@ impl PanelNode {
                 opacity: self.opacity,
                 radius: self.radius as f32,
                 border: self.border,
+                show_header: self.show_header,
                 theme: self.theme.into(),
             },
             modules: self.modules.list.iter().map(ModuleNode::to_spec).collect(),
@@ -480,5 +484,51 @@ impl From<ThemeConfigName> for ThemeName {
             ThemeConfigName::MauveVioletDark => Self::MauveVioletDark,
             ThemeConfigName::MauveVioletLight => Self::MauveVioletLight,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn panel_header_is_hidden_by_default() {
+        let config = parse_config(
+            r#"
+            panel "right-sidebar" {
+                anchor "right"
+                layout "sidebar"
+                modules {
+                    clock
+                }
+            }
+            "#,
+        );
+
+        assert!(!config.panel_specs()[0].appearance.show_header);
+    }
+
+    #[test]
+    fn panel_header_can_be_enabled() {
+        let config = parse_config(
+            r#"
+            panel "right-sidebar" {
+                anchor "right"
+                layout "sidebar"
+                show-header true
+                modules {
+                    clock
+                }
+            }
+            "#,
+        );
+
+        assert!(config.panel_specs()[0].appearance.show_header);
+    }
+
+    fn parse_config(text: &str) -> Config {
+        let config = knuffel::parse::<Config>("test.kdl", text).unwrap();
+        config.validate().unwrap();
+        config
     }
 }

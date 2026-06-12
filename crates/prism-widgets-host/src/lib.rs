@@ -5,6 +5,7 @@
 //! GitHub, no subscription APIs, no command-specific parsing.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
 use std::time::{Duration, Instant};
 
@@ -14,7 +15,9 @@ use raw_window_handle::{
 };
 use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState};
 use smithay_client_toolkit::output::{OutputHandler, OutputState};
-use smithay_client_toolkit::reexports::calloop::EventLoop;
+use smithay_client_toolkit::reexports::calloop::{
+    generic::Generic, EventLoop, Interest, Mode, PostAction,
+};
 use smithay_client_toolkit::reexports::calloop_wayland_source::WaylandSource;
 use smithay_client_toolkit::registry::{ProvidesRegistryState, RegistryState};
 use smithay_client_toolkit::shell::wlr_layer::{
@@ -38,6 +41,7 @@ use prism_widgets_ui::{PanelView, WidgetsBandApp};
 
 const MSAA_SAMPLES: u32 = 4;
 const SNAPSHOT_POLL: Duration = Duration::from_secs(1);
+const CONFIG_RELOAD_DEBOUNCE: Duration = Duration::from_millis(150);
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct HostConfig {
@@ -59,6 +63,23 @@ pub enum HostEvent {
 
 pub trait PanelDataSource {
     fn snapshot_for(&self, panel_id: &PanelId) -> PanelSnapshot;
+}
+
+pub struct ConfigReloader {
+    path: PathBuf,
+    reload: Box<dyn FnMut() -> Result<(HostConfig, Box<dyn PanelDataSource>)>>,
+}
+
+impl ConfigReloader {
+    pub fn new(
+        path: impl Into<PathBuf>,
+        reload: impl FnMut() -> Result<(HostConfig, Box<dyn PanelDataSource>)> + 'static,
+    ) -> Self {
+        Self {
+            path: path.into(),
+            reload: Box::new(reload),
+        }
+    }
 }
 
 /// Minimal synchronous runner used by the dry-run binary and tests.
@@ -92,6 +113,14 @@ impl PanelRunner {
 /// This is intentionally provider-free: callers supply a data source,
 /// and this host only turns panel specs plus snapshots into surfaces.
 pub fn run_layer_shell(config: HostConfig, source: Box<dyn PanelDataSource>) -> Result<()> {
+    run_layer_shell_with_reload(config, source, None)
+}
+
+pub fn run_layer_shell_with_reload(
+    config: HostConfig,
+    source: Box<dyn PanelDataSource>,
+    reloader: Option<ConfigReloader>,
+) -> Result<()> {
     let conn = Connection::connect_to_env().context("connect to wayland")?;
     let (globals, event_queue) =
         registry_queue_init::<LayerHost>(&conn).context("registry init")?;
@@ -105,10 +134,12 @@ pub fn run_layer_shell(config: HostConfig, source: Box<dyn PanelDataSource>) -> 
         conn: conn.clone(),
         config,
         source,
+        reloader,
         instance: wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle()),
         gpu: None,
         surfaces: Vec::new(),
         dirty: false,
+        reload_at: None,
         next_snapshot_poll: Instant::now() + SNAPSHOT_POLL,
         exit: false,
     };
@@ -117,10 +148,16 @@ pub fn run_layer_shell(config: HostConfig, source: Box<dyn PanelDataSource>) -> 
     WaylandSource::new(conn, event_queue)
         .insert(event_loop.handle())
         .map_err(|e| anyhow::anyhow!("insert wayland source: {e}"))?;
+    if let Some(reloader) = host.reloader.as_ref() {
+        watch_config(&mut event_loop, &reloader.path)?;
+    }
 
     while !host.exit {
         let now = Instant::now();
         let mut timeout = host.next_snapshot_poll.saturating_duration_since(now);
+        if let Some(deadline) = host.reload_at {
+            timeout = timeout.min(deadline.saturating_duration_since(now));
+        }
         for surface in &host.surfaces {
             if let Some(deadline) = surface.anim_deadline {
                 timeout = timeout.min(deadline.saturating_duration_since(now));
@@ -137,6 +174,10 @@ pub fn run_layer_shell(config: HostConfig, source: Box<dyn PanelDataSource>) -> 
             for surface in &mut host.surfaces {
                 surface.dirty = true;
             }
+        }
+        if host.reload_at.is_some_and(|deadline| deadline <= now) {
+            host.reload_at = None;
+            host.reload_config(&qh);
         }
         if host.dirty {
             host.dirty = false;
@@ -200,10 +241,12 @@ struct LayerHost {
     conn: Connection,
     config: HostConfig,
     source: Box<dyn PanelDataSource>,
+    reloader: Option<ConfigReloader>,
     instance: wgpu::Instance,
     gpu: Option<GpuShared>,
     surfaces: Vec<PanelSurface>,
     dirty: bool,
+    reload_at: Option<Instant>,
     next_snapshot_poll: Instant,
     exit: bool,
 }
@@ -387,6 +430,32 @@ impl LayerHost {
     fn panel_views(&self, panels: &[PanelSpec]) -> Vec<PanelView> {
         panel_views_from_source(self.source.as_ref(), panels)
     }
+
+    fn reload_config(&mut self, qh: &QueueHandle<Self>) {
+        let Some(reloader) = self.reloader.as_mut() else {
+            return;
+        };
+        let (config, source) = match (reloader.reload)() {
+            Ok(reloaded) => reloaded,
+            Err(err) => {
+                tracing::error!("config reload failed; keeping current config\n{err:#}");
+                return;
+            }
+        };
+
+        tracing::info!("config reloaded");
+        self.config = config;
+        self.source = source;
+        self.surfaces.clear();
+        let outputs: Vec<_> = self.output_state.outputs().collect();
+        for output in outputs {
+            let Some(name) = self.output_state.info(&output).and_then(|info| info.name) else {
+                continue;
+            };
+            self.create_wanted_panels_for_output(qh, output, name);
+        }
+        self.dirty = true;
+    }
 }
 
 impl LayerShellHandler for LayerHost {
@@ -526,6 +595,54 @@ delegate_compositor!(LayerHost);
 delegate_output!(LayerHost);
 delegate_layer!(LayerHost);
 delegate_registry!(LayerHost);
+
+fn watch_config(event_loop: &mut EventLoop<LayerHost>, path: &Path) -> Result<()> {
+    use rustix::fs::inotify;
+
+    let (Some(dir), Some(file_name)) = (path.parent(), path.file_name()) else {
+        return Ok(());
+    };
+    if !dir.is_dir() {
+        tracing::info!("{} absent; live config reload inactive", dir.display());
+        return Ok(());
+    }
+    let file_name = file_name.to_owned();
+
+    let fd = inotify::init(inotify::CreateFlags::NONBLOCK | inotify::CreateFlags::CLOEXEC)
+        .context("inotify init")?;
+    inotify::add_watch(
+        &fd,
+        dir,
+        inotify::WatchFlags::CLOSE_WRITE
+            | inotify::WatchFlags::MOVED_TO
+            | inotify::WatchFlags::CREATE
+            | inotify::WatchFlags::DELETE,
+    )
+    .context("inotify add_watch")?;
+    tracing::debug!("watching {} for config changes", dir.display());
+
+    event_loop
+        .handle()
+        .insert_source(
+            Generic::new(fd, Interest::READ, Mode::Level),
+            move |_, fd, host: &mut LayerHost| {
+                let mut buf = [std::mem::MaybeUninit::uninit(); 1024];
+                let mut reader = inotify::Reader::new(fd, &mut buf);
+                while let Ok(event) = reader.next() {
+                    let matches = event
+                        .file_name()
+                        .map(|name| name.to_bytes() == file_name.as_encoded_bytes())
+                        .unwrap_or(false);
+                    if matches {
+                        host.reload_at = Some(Instant::now() + CONFIG_RELOAD_DEBOUNCE);
+                    }
+                }
+                Ok(PostAction::Continue)
+            },
+        )
+        .map_err(|e| anyhow::anyhow!("insert inotify source: {e}"))?;
+    Ok(())
+}
 
 fn wants_output(panel: &PanelSpec, output_name: &str) -> bool {
     panel

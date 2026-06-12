@@ -20,6 +20,7 @@ knuffel = "3.2.0"
 miette = { version = "5.10.0", features = ["fancy-no-backtrace"] }
 pollster = "0.4"
 raw-window-handle = "0.6"
+rustix = { version = "1", features = ["fs"] }
 serde_json = "1"
 smithay-client-toolkit = { version = "0.20", default-features = false, features = ["calloop"] }
 tracing = "0.1"

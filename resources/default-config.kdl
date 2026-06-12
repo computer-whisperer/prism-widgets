@@ -35,6 +35,8 @@ panel "top-left-ci" {
     opacity 0.82
     radius 12
     border true
+    // Sidebar panel id headers are hidden by default. Set true to show them.
+    // show-header true
     theme "dark"
 
     modules {
@@ -58,6 +60,7 @@ panel "top-right-usage" {
     opacity 0.82
     radius 12
     border true
+    // show-header true
     theme "dark"
 
     modules {
@@ -81,6 +84,7 @@ panel "top-right-usage" {
 //     opacity 0.86
 //     radius 12
 //     border true
+//     show-header false
 //     theme "dark"
 //
 //     modules {

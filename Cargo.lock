@@ -1702,6 +1702,7 @@ dependencies = [
  "prism-widgets-core",
  "prism-widgets-ui",
  "raw-window-handle",
+ "rustix",
  "smithay-client-toolkit",
  "tracing",
  "wayland-backend",

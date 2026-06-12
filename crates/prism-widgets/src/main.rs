@@ -1,7 +1,7 @@
 mod config;
 
 use anyhow::Result;
-use prism_widgets_host::{run_layer_shell, HostConfig, PanelRunner};
+use prism_widgets_host::{run_layer_shell_with_reload, ConfigReloader, HostConfig, PanelRunner};
 use prism_widgets_providers::SnapshotStore;
 
 use crate::config::Config;
@@ -15,16 +15,22 @@ fn main() -> Result<()> {
         .init();
 
     let config = Config::load()?;
-    let host_config = HostConfig {
-        panels: config.panel_specs(),
-    };
-    let store = SnapshotStore::from_specs(&host_config.panels);
+    let initial_host_config = build_host_config(&config);
+    let store = SnapshotStore::from_specs(&initial_host_config.panels);
     let dry_run = std::env::args().any(|arg| arg == "--dry-run");
     if !dry_run {
-        return run_layer_shell(host_config, Box::new(store));
+        let reloader = Config::path().map(|path| {
+            ConfigReloader::new(path, || {
+                let config = Config::load()?;
+                let host_config = build_host_config(&config);
+                let store = SnapshotStore::from_specs(&host_config.panels);
+                Ok((host_config, Box::new(store)))
+            })
+        });
+        return run_layer_shell_with_reload(initial_host_config, Box::new(store), reloader);
     }
 
-    let runner = PanelRunner::new(host_config);
+    let runner = PanelRunner::new(initial_host_config);
     for snapshot in runner.snapshots(&store) {
         println!("panel {}", snapshot.panel_id.0);
         for module in snapshot.modules {
@@ -33,4 +39,10 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn build_host_config(config: &Config) -> HostConfig {
+    HostConfig {
+        panels: config.panel_specs(),
+    }
 }

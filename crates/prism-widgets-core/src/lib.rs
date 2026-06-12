@@ -66,6 +66,7 @@ pub struct PanelAppearance {
     pub opacity: f32,
     pub radius: f32,
     pub border: bool,
+    pub show_header: bool,
     pub theme: ThemeName,
 }
 

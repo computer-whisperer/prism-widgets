@@ -202,14 +202,19 @@ fn sidebar_panel_card(view: &PanelView) -> El {
         .iter()
         .map(sidebar_module_item)
         .collect::<Vec<_>>();
-    let title = ellipsize(&view.snapshot.panel_id.0, 32);
 
-    let panel = card([
-        card_header([card_title(title)]).padding(Sides::xy(tokens::SPACE_3, tokens::SPACE_2)),
+    let mut sections = Vec::new();
+    if view.appearance.show_header {
+        let title = ellipsize(&view.snapshot.panel_id.0, 32);
+        sections.push(
+            card_header([card_title(title)]).padding(Sides::xy(tokens::SPACE_3, tokens::SPACE_2)),
+        );
+    }
+    sections.push(
         card_content([item_group(modules)]).padding(Sides::xy(tokens::SPACE_2, tokens::SPACE_2)),
-    ])
-    .opacity(view.appearance.opacity)
-    .clip();
+    );
+
+    let panel = card(sections).opacity(view.appearance.opacity).clip();
     apply_panel_width(panel, view)
 }
 
