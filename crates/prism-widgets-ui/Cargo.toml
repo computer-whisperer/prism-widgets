@@ -1,0 +1,13 @@
+[package]
+name = "prism-widgets-ui"
+description = "Damascene UI projection for prism-widgets"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+damascene-core.workspace = true
+prism-widgets-core.workspace = true

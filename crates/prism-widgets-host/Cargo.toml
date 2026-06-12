@@ -1,0 +1,23 @@
+[package]
+name = "prism-widgets-host"
+description = "Provider-free panel runner abstractions for prism-widgets"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+damascene-core.workspace = true
+damascene-wgpu.workspace = true
+pollster.workspace = true
+prism-widgets-core.workspace = true
+prism-widgets-ui.workspace = true
+raw-window-handle.workspace = true
+smithay-client-toolkit.workspace = true
+tracing.workspace = true
+wayland-backend.workspace = true
+wayland-client.workspace = true
+wgpu.workspace = true

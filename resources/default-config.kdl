@@ -1,0 +1,97 @@
+// prism-widgets configuration.
+//
+// Lives at ~/.config/prism-widgets/config.kdl, overridable with
+// $PRISM_WIDGETS_CONFIG. Missing config uses a small default clock panel.
+
+panel "top-left-ci" {
+    // Connector name. Omit to put the panel on every output.
+    // For tertiary-only widgets, set this to the desired display.
+    // output "DP-1"
+
+    // "top-left" | "top" | "top-right" | "bottom-left" | "bottom" |
+    // "bottom-right" | "left" | "right"
+    anchor "top-left"
+
+    // "bar" | "sidebar". Omit to infer from anchor.
+    layout "bar"
+
+    width 720
+    height 56
+    margin 6
+
+    // true reserves compositor layout space along the anchored edge.
+    // Multiple reserving panels on the same output edge are coalesced into
+    // one layer-shell surface, so they share one compositor reservation.
+    // Set false for overlay/dashboard panels that should not move windows.
+    reserve true
+
+    // Manual override for advanced cases. Omit when using reserve.
+    // -1 means "do not participate"; 0 is layer-shell neutral.
+    // exclusive-zone 0
+
+    // "background" | "bottom" | "top" | "overlay"
+    layer "top"
+
+    opacity 0.82
+    radius 12
+    border true
+    theme "dark"
+
+    modules {
+        github repo="computer-whisperer/prism" branch="main" interval=60 token-env="GITHUB_TOKEN"
+        github repo="computer-whisperer/damascene" workflow="ci" interval=60 token-env="GITHUB_TOKEN"
+        usage source="codex" account="default" codex-home="~/.codex" interval=300
+        usage source="claude" account="default" claude-dir="~/.claude" interval=300
+        clock format="%H:%M"
+    }
+}
+
+panel "top-right-usage" {
+    // output "DP-2"
+    anchor "top-right"
+    layout "bar"
+    width 520
+    height 56
+    margin 6
+    reserve true
+    layer "top"
+    opacity 0.82
+    radius 12
+    border true
+    theme "dark"
+
+    modules {
+        usage source="codex" account="default" codex-home="~/.codex" interval=300
+        usage source="claude" account="default" claude-dir="~/.claude" interval=300
+        clock format="%a %H:%M"
+    }
+}
+
+// Example right-edge status cluster for a tertiary display.
+//
+// panel "right-sidebar" {
+//     output "DP-2"
+//     anchor "right"
+//     layout "sidebar"
+//     width 320
+//     height 56
+//     margin 6
+//     reserve true
+//     layer "top"
+//     opacity 0.86
+//     radius 12
+//     border true
+//     theme "dark"
+//
+//     modules {
+//         github repo="computer-whisperer/prism" branch="main" interval=60 token-env="GITHUB_TOKEN"
+//         github repo="computer-whisperer/damascene" workflow="ci" interval=60 token-env="GITHUB_TOKEN"
+//         usage source="codex" account="default" codex-home="~/.codex" interval=300
+//         usage source="claude" account="default" claude-dir="~/.claude" interval=300
+//         // Example second Codex profile:
+//         // usage source="codex" id="codex-work" account="work" codex-home="~/.codex-work" interval=300
+//         // Example second Claude account:
+//         // usage source="claude" id="claude-work" account="work" claude-dir="~/.claude-work" interval=300
+//         clock format="%a %b %d  %H:%M"
+//     }
+// }

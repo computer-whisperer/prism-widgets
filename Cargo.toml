@@ -1,0 +1,60 @@
+[workspace]
+members = ["crates/*"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/computer-whisperer/prism-widgets"
+authors = ["Christian Balcom"]
+
+[workspace.dependencies]
+anyhow = "1"
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+damascene-core = "0.4.1"
+damascene-wgpu = "0.4.1"
+knuffel = "3.2.0"
+miette = { version = "5.10.0", features = ["fancy-no-backtrace"] }
+pollster = "0.4"
+raw-window-handle = "0.6"
+serde_json = "1"
+smithay-client-toolkit = { version = "0.20", default-features = false, features = ["calloop"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+ureq = "2"
+wayland-backend = { version = "0.3", features = ["client_system"] }
+wayland-client = "0.31"
+wgpu = "29"
+
+prism-widgets-core = { path = "crates/prism-widgets-core" }
+prism-widgets-host = { path = "crates/prism-widgets-host" }
+prism-widgets-providers = { path = "crates/prism-widgets-providers" }
+prism-widgets-ui = { path = "crates/prism-widgets-ui" }
+
+# Keep Damascene's glyph/text stack usable in dev builds. These are leaf
+# dependencies; workspace crates stay at opt-level 0 for iteration speed.
+[profile.dev.package.fdsm]
+opt-level = 3
+[profile.dev.package.fdsm-ttf-parser]
+opt-level = 3
+[profile.dev.package.nalgebra]
+opt-level = 3
+[profile.dev.package.simba]
+opt-level = 3
+[profile.dev.package.image]
+opt-level = 3
+[profile.dev.package.ttf-parser]
+opt-level = 3
+[profile.dev.package.cosmic-text]
+opt-level = 3
+[profile.dev.package.swash]
+opt-level = 3
+[profile.dev.package.skrifa]
+opt-level = 3
+[profile.dev.package.zeno]
+opt-level = 3
+[profile.dev.package.fontdb]
+opt-level = 3

@@ -1,0 +1,18 @@
+[package]
+name = "prism-widgets-providers"
+description = "Application-specific data providers for prism-widgets"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+base64.workspace = true
+chrono.workspace = true
+prism-widgets-core.workspace = true
+prism-widgets-host.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+ureq.workspace = true

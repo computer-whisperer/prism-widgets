@@ -1,0 +1,20 @@
+[package]
+name = "prism-widgets"
+description = "Configurable Damascene layer-shell information panels"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+knuffel.workspace = true
+miette.workspace = true
+prism-widgets-core.workspace = true
+prism-widgets-host.workspace = true
+prism-widgets-providers.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

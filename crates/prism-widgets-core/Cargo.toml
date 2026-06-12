@@ -1,0 +1,11 @@
+[package]
+name = "prism-widgets-core"
+description = "Shared data model for prism-widgets panels and modules"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
