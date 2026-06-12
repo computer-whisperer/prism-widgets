@@ -31,6 +31,18 @@ default; parse errors are startup errors.
 
 See [`resources/default-config.kdl`](resources/default-config.kdl).
 
+Useful startup commands:
+
+```bash
+prism-widgets --print-config-path
+prism-widgets --init-config
+prism-widgets --dump-default-config
+prism-widgets --config /tmp/widgets.kdl --dry-run
+```
+
+`--init-config` creates the parent directory and writes the documented sample
+config, but it will not overwrite an existing file.
+
 Panels reserve compositor layout space by default with `reserve true`.
 Reserving panels on the same output edge are coalesced into one layer-shell
 surface, so a left and right top panel share one compositor reservation and
@@ -103,6 +115,7 @@ Any other `usage` source uses the `SOURCE-usage-json` helper convention. A
 ```bash
 cargo run -p prism-widgets -- --dry-run
 PRISM_WIDGETS_CONFIG=resources/default-config.kdl cargo run -p prism-widgets -- --dry-run
+cargo run -p prism-widgets -- --config resources/default-config.kdl --dry-run
 cargo run -p prism-widgets
 ```
 

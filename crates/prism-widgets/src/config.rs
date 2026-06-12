@@ -246,7 +246,11 @@ impl Config {
             tracing::warn!("no config path resolvable (no $HOME); using defaults");
             return Ok(Self::default());
         };
-        let text = match std::fs::read_to_string(&path) {
+        Self::load_from_path(&path)
+    }
+
+    pub fn load_from_path(path: &std::path::Path) -> Result<Self> {
+        let text = match std::fs::read_to_string(path) {
             Ok(text) => text,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 tracing::info!("no config at {}; using defaults", path.display());
@@ -524,6 +528,31 @@ mod tests {
         );
 
         assert!(config.panel_specs()[0].appearance.show_header);
+    }
+
+    #[test]
+    fn loads_config_from_explicit_path() {
+        let path = std::env::temp_dir().join(format!(
+            "prism-widgets-config-test-{}.kdl",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            r#"
+            panel "top" {
+                anchor "top-right"
+                modules {
+                    clock format="%H:%M"
+                }
+            }
+            "#,
+        )
+        .unwrap();
+
+        let config = Config::load_from_path(&path).unwrap();
+        assert_eq!(config.panel_specs()[0].id.0, "top");
+
+        std::fs::remove_file(path).unwrap();
     }
 
     fn parse_config(text: &str) -> Config {
