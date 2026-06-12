@@ -1,10 +1,23 @@
 //! Damascene projection for panel snapshots.
 
+use std::sync::LazyLock;
+
 use damascene_core::prelude::*;
 use prism_widgets_core::{
     ModuleSnapshot, ModuleStatus, ModuleValue, PanelAnchor, PanelAppearance, PanelLayout,
     PanelSnapshot, ThemeName,
 };
+
+const GITHUB_SVG: &str = include_str!("../assets/icons/github.svg");
+const OPENAI_SVG: &str = include_str!("../assets/icons/openai.svg");
+const ANTHROPIC_SVG: &str = include_str!("../assets/icons/anthropic.svg");
+
+static ICON_GITHUB: LazyLock<SvgIcon> =
+    LazyLock::new(|| SvgIcon::parse_current_color(GITHUB_SVG).expect("parse github.svg"));
+static ICON_OPENAI: LazyLock<SvgIcon> =
+    LazyLock::new(|| SvgIcon::parse_current_color(OPENAI_SVG).expect("parse openai.svg"));
+static ICON_ANTHROPIC: LazyLock<SvgIcon> =
+    LazyLock::new(|| SvgIcon::parse_current_color(ANTHROPIC_SVG).expect("parse anthropic.svg"));
 
 #[derive(Clone, Debug)]
 pub struct PanelView {
@@ -211,7 +224,15 @@ fn apply_panel_width(mut panel: El, view: &PanelView) -> El {
 }
 
 fn module_chip(module: &ModuleSnapshot) -> El {
-    let mut cells = vec![text(ellipsize(&module.title, 22)).caption().muted()];
+    let mut cells = Vec::new();
+    if let Some(glyph) = module_brand_icon(module) {
+        cells.push(
+            icon(glyph)
+                .icon_size(tokens::ICON_XS)
+                .color(tokens::MUTED_FOREGROUND),
+        );
+    }
+    cells.push(text(ellipsize(&module.title, 22)).caption().muted());
     match &module.value {
         ModuleValue::State { label, detail } => {
             cells.push(status_badge_with_label(module.status, ellipsize(label, 20)));
@@ -270,7 +291,11 @@ fn sidebar_module_item(module: &ModuleSnapshot) -> El {
         content.extend(metrics.iter().map(usage_metric_bar));
     }
 
-    let mut children = vec![item_content(content).gap(tokens::SPACE_2)];
+    let mut children = Vec::new();
+    if let Some(glyph) = module_brand_icon(module) {
+        children.push(item_media_icon(glyph));
+    }
+    children.push(item_content(content).gap(tokens::SPACE_2));
     if !matches!(module.status, ModuleStatus::Ok) {
         children.push(item_actions([status_badge(module.status)]));
     }
@@ -497,6 +522,36 @@ fn metric_color(percent: f32) -> Color {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BrandIconKind {
+    GitHub,
+    OpenAi,
+    Anthropic,
+}
+
+fn module_brand_icon(module: &ModuleSnapshot) -> Option<SvgIcon> {
+    match module_brand_icon_kind(module)? {
+        BrandIconKind::GitHub => Some(ICON_GITHUB.clone()),
+        BrandIconKind::OpenAi => Some(ICON_OPENAI.clone()),
+        BrandIconKind::Anthropic => Some(ICON_ANTHROPIC.clone()),
+    }
+}
+
+fn module_brand_icon_kind(module: &ModuleSnapshot) -> Option<BrandIconKind> {
+    let id = module.id.to_ascii_lowercase();
+    let title = module.title.to_ascii_lowercase();
+    if id.starts_with("codex") || title.starts_with("codex") || title.contains("openai") {
+        return Some(BrandIconKind::OpenAi);
+    }
+    if id.starts_with("claude") || title.starts_with("claude") || title.contains("anthropic") {
+        return Some(BrandIconKind::Anthropic);
+    }
+    if id.contains('/') || title.contains('/') || title.contains("github") {
+        return Some(BrandIconKind::GitHub);
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -560,5 +615,50 @@ mod tests {
             strip_percent_segments("7d 7% - pro - credits 0 - resets Thu 10:41"),
             "pro - credits 0 - resets Thu 10:41"
         );
+    }
+
+    #[test]
+    fn classifies_brand_icons_from_module_identity() {
+        assert_eq!(
+            module_brand_icon_kind(&module_with_identity("codex", "codex default")),
+            Some(BrandIconKind::OpenAi)
+        );
+        assert_eq!(
+            module_brand_icon_kind(&module_with_identity("claude", "claude work")),
+            Some(BrandIconKind::Anthropic)
+        );
+        assert_eq!(
+            module_brand_icon_kind(&module_with_identity(
+                "computer-whisperer/prism",
+                "computer-whisperer/prism"
+            )),
+            Some(BrandIconKind::GitHub)
+        );
+        assert_eq!(
+            module_brand_icon_kind(&module_with_identity("clock", "clock")),
+            None
+        );
+    }
+
+    #[test]
+    fn parses_brand_icon_assets() {
+        assert!(module_brand_icon(&module_with_identity("codex", "codex default")).is_some());
+        assert!(module_brand_icon(&module_with_identity("claude", "claude work")).is_some());
+        assert!(module_brand_icon(&module_with_identity(
+            "computer-whisperer/prism",
+            "computer-whisperer/prism"
+        ))
+        .is_some());
+    }
+
+    fn module_with_identity(id: &str, title: &str) -> ModuleSnapshot {
+        ModuleSnapshot {
+            id: id.into(),
+            title: title.into(),
+            value: ModuleValue::Text("value".into()),
+            status: ModuleStatus::Ok,
+            updated_at: None,
+            stale_after: None,
+        }
     }
 }
