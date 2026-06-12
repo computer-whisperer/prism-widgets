@@ -248,28 +248,33 @@ fn module_chip(module: &ModuleSnapshot) -> El {
 }
 
 fn sidebar_module_item(module: &ModuleSnapshot) -> El {
-    let mut content = vec![row([
-        text(ellipsize(&module.title, 30)).label(),
-        spacer(),
-        module_value_summary(module),
-    ])
-    .gap(tokens::SPACE_2)
-    .align(Align::Center)];
+    let metrics = module_usage_metrics(module);
+    let mut header = vec![text(ellipsize(&module.title, 30)).label(), spacer()];
+    if metrics.is_empty() {
+        header.push(module_value_summary(module));
+    }
+
+    let mut content = vec![row(header).gap(tokens::SPACE_2).align(Align::Center)];
     if let Some(detail) = module_detail_text(module) {
         content.push(text(detail).caption().muted());
     }
-    if let Some(fraction) = module_fraction(module) {
-        content.push(
-            progress_with_color(fraction, status_color(module.status))
-                .height(Size::Fixed(5.0))
-                .width(Size::Fill(1.0)),
-        );
+    if metrics.is_empty() {
+        if let Some(fraction) = module_fraction(module) {
+            content.push(
+                progress_with_color(fraction, status_color(module.status))
+                    .height(Size::Fixed(5.0))
+                    .width(Size::Fill(1.0)),
+            );
+        }
+    } else {
+        content.extend(metrics.iter().map(usage_metric_bar));
     }
 
-    item([
-        item_content(content).gap(tokens::SPACE_1),
-        item_actions([status_badge(module.status)]),
-    ])
+    let mut children = vec![item_content(content).gap(tokens::SPACE_2)];
+    if !matches!(module.status, ModuleStatus::Ok) {
+        children.push(item_actions([status_badge(module.status)]));
+    }
+    item(children)
 }
 
 fn module_value_text(module: &ModuleSnapshot) -> El {
@@ -302,9 +307,98 @@ fn module_detail_text(module: &ModuleSnapshot) -> Option<String> {
         ModuleValue::State {
             detail: Some(detail),
             ..
-        } => Some(ellipsize(detail, 56)),
+        } => {
+            let detail = strip_percent_segments(detail);
+            (!detail.is_empty()).then(|| ellipsize(&detail, 56))
+        }
         _ => None,
     }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct UsageMetric {
+    label: String,
+    percent: f32,
+}
+
+fn module_usage_metrics(module: &ModuleSnapshot) -> Vec<UsageMetric> {
+    let ModuleValue::State { label, detail } = &module.value else {
+        return Vec::new();
+    };
+    let mut metrics = Vec::new();
+    collect_usage_metrics(label, &mut metrics);
+    if let Some(detail) = detail {
+        collect_usage_metrics(detail, &mut metrics);
+    }
+    metrics
+}
+
+fn collect_usage_metrics(value: &str, metrics: &mut Vec<UsageMetric>) {
+    let mut offset = 0;
+    while let Some(relative_percent_index) = value[offset..].find('%') {
+        let percent_index = offset + relative_percent_index;
+        let mut number_start = percent_index;
+        while let Some((previous_index, ch)) = value[..number_start].char_indices().next_back() {
+            if ch.is_ascii_digit() || ch == '.' || ch.is_whitespace() {
+                number_start = previous_index;
+            } else {
+                break;
+            }
+        }
+
+        let number = value[number_start..percent_index].trim();
+        if let Ok(percent) = number.parse::<f32>() {
+            let label = metric_label(&value[offset..number_start]);
+            metrics.push(UsageMetric { label, percent });
+        }
+
+        offset = percent_index + 1;
+    }
+}
+
+fn metric_label(prefix: &str) -> String {
+    let label = prefix
+        .rsplit(metric_separator)
+        .next()
+        .unwrap_or(prefix)
+        .trim();
+    if label.is_empty() {
+        "usage".into()
+    } else {
+        ellipsize(label, 18)
+    }
+}
+
+fn usage_metric_bar(metric: &UsageMetric) -> El {
+    let fraction = (metric.percent / 100.0).clamp(0.0, 1.0);
+    column([
+        row([
+            text(ellipsize(&metric.label, 18)).caption().muted(),
+            spacer(),
+            text(format!("{:.0}%", metric.percent.clamp(0.0, 999.0)))
+                .caption()
+                .muted(),
+        ])
+        .align(Align::Center),
+        progress_with_color(fraction, metric_color(metric.percent))
+            .height(Size::Fixed(7.0))
+            .width(Size::Fill(1.0)),
+    ])
+    .gap(3.0)
+    .align(Align::Stretch)
+}
+
+fn strip_percent_segments(detail: &str) -> String {
+    detail
+        .split(metric_separator)
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty() && !segment.contains('%'))
+        .collect::<Vec<_>>()
+        .join(" - ")
+}
+
+fn metric_separator(ch: char) -> bool {
+    matches!(ch, '|' | ',' | ';' | '/' | '-') || ch == '\u{00b7}'
 }
 
 fn module_fraction(module: &ModuleSnapshot) -> Option<f32> {
@@ -393,6 +487,16 @@ fn status_color(status: ModuleStatus) -> Color {
     }
 }
 
+fn metric_color(percent: f32) -> Color {
+    if percent >= 80.0 {
+        tokens::DESTRUCTIVE
+    } else if percent >= 50.0 {
+        tokens::WARNING
+    } else {
+        tokens::SUCCESS
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -419,5 +523,42 @@ mod tests {
         };
 
         assert_eq!(module_fraction(&module), Some(0.42));
+    }
+
+    #[test]
+    fn extracts_multiple_usage_metrics_from_state() {
+        let module = ModuleSnapshot {
+            id: "usage".into(),
+            title: "codex".into(),
+            value: ModuleValue::State {
+                label: "5h 18%".into(),
+                detail: Some("7d 7% - pro - credits 0".into()),
+            },
+            status: ModuleStatus::Ok,
+            updated_at: None,
+            stale_after: None,
+        };
+
+        assert_eq!(
+            module_usage_metrics(&module),
+            vec![
+                UsageMetric {
+                    label: "5h".into(),
+                    percent: 18.0,
+                },
+                UsageMetric {
+                    label: "7d".into(),
+                    percent: 7.0,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn strips_percent_segments_from_sidebar_detail() {
+        assert_eq!(
+            strip_percent_segments("7d 7% - pro - credits 0 - resets Thu 10:41"),
+            "pro - credits 0 - resets Thu 10:41"
+        );
     }
 }
