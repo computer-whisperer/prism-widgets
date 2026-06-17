@@ -47,28 +47,6 @@ impl PanelView {
 }
 
 #[derive(Clone, Debug)]
-pub struct WidgetsApp {
-    view: PanelView,
-}
-
-impl WidgetsApp {
-    pub fn new(
-        appearance: PanelAppearance,
-        anchor: PanelAnchor,
-        width: Option<u32>,
-        snapshot: PanelSnapshot,
-    ) -> Self {
-        Self {
-            view: PanelView::new(appearance, anchor, PanelLayout::Bar, width, snapshot),
-        }
-    }
-
-    pub fn set_snapshot(&mut self, snapshot: PanelSnapshot) {
-        self.view.snapshot = snapshot;
-    }
-}
-
-#[derive(Clone, Debug)]
 pub struct WidgetsBandApp {
     layout: PanelLayout,
     views: Vec<PanelView>,
@@ -84,19 +62,6 @@ impl WidgetsBandApp {
             self.layout = view.layout;
         }
         self.views = views;
-    }
-}
-
-impl App for WidgetsApp {
-    fn theme(&self) -> Theme {
-        theme_of(self.view.appearance.theme)
-    }
-
-    fn build(&self, _cx: &BuildCx) -> El {
-        overlays(
-            cluster_shell(self.view.layout, std::slice::from_ref(&self.view)),
-            Vec::<Option<El>>::new(),
-        )
     }
 }
 
