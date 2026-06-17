@@ -90,6 +90,62 @@ pub enum ModuleSpec {
     Usage(UsageSpec),
 }
 
+impl ModuleSpec {
+    pub fn id(&self) -> &str {
+        match self {
+            ModuleSpec::Clock(spec) => &spec.id,
+            ModuleSpec::Command(spec) => &spec.id,
+            ModuleSpec::GitHub(spec) => &spec.id,
+            ModuleSpec::Usage(spec) => &spec.id,
+        }
+    }
+
+    /// Background refresh interval for modules polled on worker threads.
+    ///
+    /// `None` for modules the host renders locally and synchronously (the
+    /// clock), which are never scheduled on a worker.
+    pub fn poll_interval(&self) -> Option<Duration> {
+        match self {
+            ModuleSpec::Clock(_) => None,
+            ModuleSpec::Command(spec) => Some(spec.interval),
+            ModuleSpec::GitHub(spec) => Some(spec.interval),
+            ModuleSpec::Usage(spec) => Some(spec.interval),
+        }
+    }
+}
+
+/// Render the clock locally from the current wall-clock time.
+///
+/// The clock is a pure function of its spec and the current time, so it
+/// lives here rather than in a provider: both the live host and the
+/// dry-run path render it without any worker thread or I/O.
+pub fn clock_snapshot(spec: &ClockSpec) -> ModuleSnapshot {
+    ModuleSnapshot {
+        id: spec.id.clone(),
+        title: "clock".into(),
+        value: ModuleValue::Text(chrono::Local::now().format(&spec.format).to_string()),
+        status: ModuleStatus::Ok,
+        updated_at: Some(SystemTime::now()),
+        stale_after: None,
+    }
+}
+
+/// A freshly polled module snapshot pushed from a worker thread into the
+/// host event loop.
+///
+/// `epoch` tags the provider generation that produced it; the host drops
+/// updates whose epoch does not match the current configuration, so results
+/// from workers still in flight across a config reload are ignored. `module`
+/// is the spec module id used as the cache key, which can differ from
+/// `snapshot.id` when a provider overrides the id in its payload.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ModuleUpdate {
+    pub epoch: u64,
+    pub panel: PanelId,
+    pub module: String,
+    pub snapshot: ModuleSnapshot,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClockSpec {
     pub id: String,
@@ -149,6 +205,31 @@ pub struct ModuleSnapshot {
     pub status: ModuleStatus,
     pub updated_at: Option<SystemTime>,
     pub stale_after: Option<Duration>,
+}
+
+impl ModuleSnapshot {
+    /// Equality on the fields that affect rendering, ignoring freshness
+    /// timestamps. Two snapshots that paint identically are display-equal
+    /// even when produced at different instants — this is what lets the host
+    /// suppress redundant redraws (e.g. a clock whose minute has not changed).
+    pub fn display_eq(&self, other: &Self) -> bool {
+        self.id == other.id
+            && self.title == other.title
+            && self.value == other.value
+            && self.status == other.status
+    }
+
+    /// Placeholder rendered before a module's first snapshot arrives.
+    pub fn loading(id: impl Into<String>, title: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            title: title.into(),
+            value: ModuleValue::Text("…".into()),
+            status: ModuleStatus::Unknown,
+            updated_at: None,
+            stale_after: None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]

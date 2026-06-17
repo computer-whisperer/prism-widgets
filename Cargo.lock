@@ -1690,6 +1690,9 @@ dependencies = [
 [[package]]
 name = "prism-widgets-core"
 version = "0.1.0"
+dependencies = [
+ "chrono",
+]
 
 [[package]]
 name = "prism-widgets-host"
