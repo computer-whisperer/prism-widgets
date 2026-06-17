@@ -57,9 +57,6 @@ fetches once synchronously via `SnapshotStore`.
 
 - Per-module threads suit a status surface's handful of modules; swap
   `SchedulerHandle` for a bounded pool if module counts ever grow large.
-- Wire the unused `WidgetsApp` out or into use (only `WidgetsBandApp` is built).
-- Revisit the usage providers' string round-trip: structured values are
-  flattened to `State` strings and re-parsed in the UI.
 
 ## Prism IPC
 

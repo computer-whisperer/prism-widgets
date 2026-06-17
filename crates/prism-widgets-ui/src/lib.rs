@@ -5,7 +5,7 @@ use std::sync::LazyLock;
 use damascene_core::prelude::*;
 use prism_widgets_core::{
     ModuleSnapshot, ModuleStatus, ModuleValue, PanelAnchor, PanelAppearance, PanelLayout,
-    PanelSnapshot, ThemeName,
+    PanelSnapshot, ThemeName, UsageMetric, UsageValue,
 };
 
 const GITHUB_SVG: &str = include_str!("../assets/icons/github.svg");
@@ -210,6 +210,15 @@ fn module_chip(module: &ModuleSnapshot) -> El {
                 cells.push(text(ellipsize(detail, 28)).caption().muted());
             }
         }
+        ModuleValue::Usage(usage) => {
+            cells.push(status_badge_with_label(
+                module.status,
+                ellipsize(&usage_headline(usage), 20),
+            ));
+            if let Some(detail) = &usage.detail {
+                cells.push(text(ellipsize(detail, 28)).caption().muted());
+            }
+        }
         _ => {
             cells.push(module_value_text(module).label());
             if !matches!(module.status, ModuleStatus::Ok) {
@@ -281,6 +290,9 @@ fn module_value_summary(module: &ModuleSnapshot) -> El {
         ModuleValue::State { label, .. } => {
             status_badge_with_label(module.status, ellipsize(label, 24))
         }
+        ModuleValue::Usage(usage) => {
+            status_badge_with_label(module.status, ellipsize(&usage_headline(usage), 24))
+        }
         _ => text(module_value_plain(module)).label(),
     }
 }
@@ -294,74 +306,39 @@ fn module_value_plain(module: &ModuleSnapshot) -> String {
             None => current.to_string(),
         },
         ModuleValue::State { label, .. } => ellipsize(label, 36),
+        ModuleValue::Usage(usage) => ellipsize(&usage_headline(usage), 36),
     }
 }
 
 fn module_detail_text(module: &ModuleSnapshot) -> Option<String> {
-    match &module.value {
-        ModuleValue::State {
-            detail: Some(detail),
-            ..
-        } => {
-            let detail = strip_percent_segments(detail);
-            (!detail.is_empty()).then(|| ellipsize(&detail, 56))
-        }
+    let detail = match &module.value {
+        ModuleValue::Usage(usage) => usage.detail.as_deref(),
+        ModuleValue::State { detail, .. } => detail.as_deref(),
         _ => None,
+    }?;
+    (!detail.is_empty()).then(|| ellipsize(detail, 56))
+}
+
+/// The metric gauges to draw as bars: a usage value's windows, or none for
+/// other module kinds (which fall back to a single fraction bar).
+fn module_usage_metrics(module: &ModuleSnapshot) -> &[UsageMetric] {
+    match &module.value {
+        ModuleValue::Usage(usage) => &usage.metrics,
+        _ => &[],
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
-struct UsageMetric {
-    label: String,
-    percent: f32,
+/// Compact one-line summary of a usage value: its headline (first) gauge.
+fn usage_headline(usage: &UsageValue) -> String {
+    usage
+        .metrics
+        .first()
+        .map(|metric| format!("{} {}", metric.label, format_percent(metric.percent)))
+        .unwrap_or_else(|| "usage".into())
 }
 
-fn module_usage_metrics(module: &ModuleSnapshot) -> Vec<UsageMetric> {
-    let ModuleValue::State { label, detail } = &module.value else {
-        return Vec::new();
-    };
-    let mut metrics = Vec::new();
-    collect_usage_metrics(label, &mut metrics);
-    if let Some(detail) = detail {
-        collect_usage_metrics(detail, &mut metrics);
-    }
-    metrics
-}
-
-fn collect_usage_metrics(value: &str, metrics: &mut Vec<UsageMetric>) {
-    let mut offset = 0;
-    while let Some(relative_percent_index) = value[offset..].find('%') {
-        let percent_index = offset + relative_percent_index;
-        let mut number_start = percent_index;
-        while let Some((previous_index, ch)) = value[..number_start].char_indices().next_back() {
-            if ch.is_ascii_digit() || ch == '.' || ch.is_whitespace() {
-                number_start = previous_index;
-            } else {
-                break;
-            }
-        }
-
-        let number = value[number_start..percent_index].trim();
-        if let Ok(percent) = number.parse::<f32>() {
-            let label = metric_label(&value[offset..number_start]);
-            metrics.push(UsageMetric { label, percent });
-        }
-
-        offset = percent_index + 1;
-    }
-}
-
-fn metric_label(prefix: &str) -> String {
-    let label = prefix
-        .rsplit(metric_separator)
-        .next()
-        .unwrap_or(prefix)
-        .trim();
-    if label.is_empty() {
-        "usage".into()
-    } else {
-        ellipsize(label, 18)
-    }
+fn format_percent(percent: f32) -> String {
+    format!("{:.0}%", percent.clamp(0.0, 999.0))
 }
 
 fn usage_metric_bar(metric: &UsageMetric) -> El {
@@ -370,9 +347,7 @@ fn usage_metric_bar(metric: &UsageMetric) -> El {
         row([
             text(ellipsize(&metric.label, 18)).caption().muted(),
             spacer(),
-            text(format!("{:.0}%", metric.percent.clamp(0.0, 999.0)))
-                .caption()
-                .muted(),
+            text(format_percent(metric.percent)).caption().muted(),
         ])
         .align(Align::Center),
         progress_with_color(fraction, metric_color(metric.percent))
@@ -383,19 +358,6 @@ fn usage_metric_bar(metric: &UsageMetric) -> El {
     .align(Align::Stretch)
 }
 
-fn strip_percent_segments(detail: &str) -> String {
-    detail
-        .split(metric_separator)
-        .map(str::trim)
-        .filter(|segment| !segment.is_empty() && !segment.contains('%'))
-        .collect::<Vec<_>>()
-        .join(" - ")
-}
-
-fn metric_separator(ch: char) -> bool {
-    matches!(ch, '|' | ',' | ';' | '/' | '-') || ch == '\u{00b7}'
-}
-
 fn module_fraction(module: &ModuleSnapshot) -> Option<f32> {
     match &module.value {
         ModuleValue::Percent(frac) => Some(frac.clamp(0.0, 1.0)),
@@ -403,25 +365,12 @@ fn module_fraction(module: &ModuleSnapshot) -> Option<f32> {
             current,
             total: Some(total),
         } if *total > 0 => Some((*current as f32 / *total as f32).clamp(0.0, 1.0)),
-        ModuleValue::State { label, detail } => percent_in_text(label)
-            .or_else(|| detail.as_deref().and_then(percent_in_text))
-            .map(|percent| (percent / 100.0).clamp(0.0, 1.0)),
+        ModuleValue::Usage(usage) => usage
+            .metrics
+            .first()
+            .map(|metric| (metric.percent / 100.0).clamp(0.0, 1.0)),
         _ => None,
     }
-}
-
-fn percent_in_text(value: &str) -> Option<f32> {
-    let percent_index = value.find('%')?;
-    let prefix = &value[..percent_index];
-    let number = prefix
-        .chars()
-        .rev()
-        .take_while(|ch| ch.is_ascii_digit() || *ch == '.')
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect::<String>();
-    number.parse().ok()
 }
 
 fn ellipsize(value: &str, max_chars: usize) -> String {
@@ -526,64 +475,56 @@ fn module_brand_icon_kind(module: &ModuleSnapshot) -> Option<BrandIconKind> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn extracts_percent_from_usage_labels() {
-        assert_eq!(percent_in_text("5h 18%"), Some(18.0));
-        assert_eq!(percent_in_text("7d 7% - pro"), Some(7.0));
-        assert_eq!(percent_in_text("idle"), None);
-    }
-
-    #[test]
-    fn derives_module_fraction_from_state_detail() {
-        let module = ModuleSnapshot {
+    fn usage_module(metrics: Vec<UsageMetric>, detail: Option<&str>) -> ModuleSnapshot {
+        ModuleSnapshot {
             id: "usage".into(),
             title: "codex".into(),
-            value: ModuleValue::State {
-                label: "usage".into(),
-                detail: Some("7d 42% - pro".into()),
-            },
+            value: ModuleValue::Usage(UsageValue {
+                metrics,
+                detail: detail.map(ToOwned::to_owned),
+            }),
             status: ModuleStatus::Ok,
             updated_at: None,
             stale_after: None,
-        };
+        }
+    }
 
-        assert_eq!(module_fraction(&module), Some(0.42));
+    fn metric(label: &str, percent: f32) -> UsageMetric {
+        UsageMetric {
+            label: label.into(),
+            percent,
+        }
     }
 
     #[test]
-    fn extracts_multiple_usage_metrics_from_state() {
-        let module = ModuleSnapshot {
-            id: "usage".into(),
-            title: "codex".into(),
-            value: ModuleValue::State {
-                label: "5h 18%".into(),
-                detail: Some("7d 7% - pro - credits 0".into()),
-            },
-            status: ModuleStatus::Ok,
-            updated_at: None,
-            stale_after: None,
+    fn headline_is_the_first_gauge() {
+        let usage = UsageValue {
+            metrics: vec![metric("5h", 18.0), metric("7d", 7.0)],
+            detail: Some("pro · resets Thu 10:41".into()),
         };
-
+        assert_eq!(usage_headline(&usage), "5h 18%");
         assert_eq!(
-            module_usage_metrics(&module),
-            vec![
-                UsageMetric {
-                    label: "5h".into(),
-                    percent: 18.0,
-                },
-                UsageMetric {
-                    label: "7d".into(),
-                    percent: 7.0,
-                },
-            ]
+            usage_headline(&UsageValue {
+                metrics: vec![],
+                detail: None,
+            }),
+            "usage"
         );
     }
 
     #[test]
-    fn strips_percent_segments_from_sidebar_detail() {
+    fn module_fraction_tracks_the_headline_gauge() {
+        let module = usage_module(vec![metric("5h", 42.0)], None);
+        assert_eq!(module_fraction(&module), Some(0.42));
+        assert_eq!(module_fraction(&usage_module(vec![], None)), None);
+    }
+
+    #[test]
+    fn usage_detail_passes_through_without_reparsing() {
+        let module = usage_module(vec![metric("5h", 1.0)], Some("pro · credits 0"));
         assert_eq!(
-            strip_percent_segments("7d 7% - pro - credits 0 - resets Thu 10:41"),
-            "pro - credits 0 - resets Thu 10:41"
+            module_detail_text(&module).as_deref(),
+            Some("pro · credits 0")
         );
     }
 

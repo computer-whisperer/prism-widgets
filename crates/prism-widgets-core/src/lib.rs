@@ -244,6 +244,27 @@ pub enum ModuleValue {
         label: String,
         detail: Option<String>,
     },
+    Usage(UsageValue),
+}
+
+/// Subscription/quota usage: one or more named percentage gauges plus
+/// non-numeric context (plan, credits, reset time).
+///
+/// Carried structured rather than pre-formatted into a label so the UI can
+/// render gauges without re-parsing percentages back out of a string — the
+/// provider owns the numbers, the UI owns their presentation.
+#[derive(Clone, Debug, PartialEq)]
+pub struct UsageValue {
+    /// Ordered gauges; the first is the headline shown in compact layouts.
+    pub metrics: Vec<UsageMetric>,
+    /// Remaining context with no percentage of its own (plan, credits, resets).
+    pub detail: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct UsageMetric {
+    pub label: String,
+    pub percent: f32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

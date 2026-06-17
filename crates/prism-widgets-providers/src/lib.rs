@@ -15,7 +15,7 @@ use std::time::{Duration, Instant, SystemTime};
 use base64::Engine;
 use prism_widgets_core::{
     clock_snapshot, CommandSpec, GitHubSpec, ModuleSnapshot, ModuleSpec, ModuleStatus, ModuleUpdate,
-    ModuleValue, PanelId, PanelSnapshot, PanelSpec, UsageSpec,
+    ModuleValue, PanelId, PanelSnapshot, PanelSpec, UsageMetric, UsageValue, UsageSpec,
 };
 use prism_widgets_host::{PanelDataSource, ProviderHandle, SnapshotSender};
 use serde_json::Value;
@@ -522,16 +522,25 @@ struct CodexUsageCredits {
 
 impl ClaudeUsage {
     fn into_snapshot(self, spec: &UsageSpec) -> ModuleSnapshot {
-        let five_hour = self.five_hour.as_ref().map(|window| window.utilization);
-        let seven_day = self.seven_day.as_ref().map(|window| window.utilization);
-        let highest = [five_hour, seven_day, self.sonnet_pct(), self.opus_pct()]
-            .into_iter()
-            .flatten()
-            .fold(0.0, f64::max);
-        let mut details = Vec::new();
-        if let Some(seven_day) = seven_day {
-            details.push(format!("7d {}", format_usage_percent(seven_day)));
+        let highest = [
+            self.five_hour.as_ref().map(|window| window.utilization),
+            self.seven_day.as_ref().map(|window| window.utilization),
+            self.sonnet_pct(),
+            self.opus_pct(),
+        ]
+        .into_iter()
+        .flatten()
+        .fold(0.0, f64::max);
+
+        let mut metrics = Vec::new();
+        if let Some(window) = &self.five_hour {
+            metrics.push(usage_metric("5h", window.utilization));
         }
+        if let Some(window) = &self.seven_day {
+            metrics.push(usage_metric("7d", window.utilization));
+        }
+
+        let mut details = Vec::new();
         if let Some(plan) = self.plan {
             details.push(plan);
         }
@@ -544,15 +553,11 @@ impl ClaudeUsage {
             details.push(format!("resets {reset}"));
         }
         let detail = (!details.is_empty()).then(|| details.join(" · "));
-        let label = match five_hour {
-            Some(five_hour) => format!("5h {}", format_usage_percent(five_hour)),
-            None => "usage".into(),
-        };
 
         ModuleSnapshot {
             id: spec.id.clone(),
             title: usage_title(spec),
-            value: ModuleValue::State { label, detail },
+            value: ModuleValue::Usage(UsageValue { metrics, detail }),
             status: usage_status(highest),
             updated_at: Some(SystemTime::now()),
             stale_after: Some(spec.interval),
@@ -570,32 +575,23 @@ impl ClaudeUsage {
 
 impl CodexUsage {
     fn into_snapshot(self, spec: &UsageSpec) -> ModuleSnapshot {
-        let primary = self.primary.as_ref().map(|window| window.used_percent);
-        let secondary = self.secondary.as_ref().map(|window| window.used_percent);
-        let highest = [primary, secondary]
-            .into_iter()
-            .flatten()
-            .fold(0.0, f64::max);
-        let label = self
-            .primary
-            .as_ref()
-            .map(|window| {
-                format!(
-                    "{} {}",
-                    window_label(window),
-                    format_usage_percent(window.used_percent)
-                )
-            })
-            .unwrap_or_else(|| "usage".into());
+        let highest = [
+            self.primary.as_ref().map(|window| window.used_percent),
+            self.secondary.as_ref().map(|window| window.used_percent),
+        ]
+        .into_iter()
+        .flatten()
+        .fold(0.0, f64::max);
+
+        let mut metrics = Vec::new();
+        if let Some(window) = &self.primary {
+            metrics.push(usage_metric(window_label(window), window.used_percent));
+        }
+        if let Some(window) = &self.secondary {
+            metrics.push(usage_metric(window_label(window), window.used_percent));
+        }
 
         let mut details = Vec::new();
-        if let Some(window) = self.secondary.as_ref() {
-            details.push(format!(
-                "{} {}",
-                window_label(window),
-                format_usage_percent(window.used_percent)
-            ));
-        }
         if let Some(plan) = self.plan {
             details.push(plan);
         }
@@ -615,7 +611,7 @@ impl CodexUsage {
         ModuleSnapshot {
             id: spec.id.clone(),
             title: usage_title(spec),
-            value: ModuleValue::State { label, detail },
+            value: ModuleValue::Usage(UsageValue { metrics, detail }),
             status: usage_status(highest),
             updated_at: Some(SystemTime::now()),
             stale_after: Some(spec.interval),
@@ -1239,8 +1235,11 @@ fn usage_status(percent: f64) -> ModuleStatus {
     }
 }
 
-fn format_usage_percent(percent: f64) -> String {
-    format!("{:.0}%", percent.clamp(0.0, 999.0))
+fn usage_metric(label: &str, percent: f64) -> UsageMetric {
+    UsageMetric {
+        label: label.to_string(),
+        percent: percent as f32,
+    }
 }
 
 fn format_reset_time(value: &str) -> Option<String> {
