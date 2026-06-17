@@ -31,15 +31,35 @@
 `prism-widgets-ui` turns snapshots into Damascene `El` trees. It should not
 perform I/O.
 
-## Near-Term Milestones
+## Provider Scheduling
 
-1. Port the `prism-bar` layer-shell host loop into `prism-widgets-host` against
-   `PanelSpec` and `PanelSnapshot`.
-2. Add provider scheduling on worker threads, feeding full snapshots into the
-   host event loop.
-3. Implement a generic `command` provider before bespoke API clients.
-4. Add GitHub status provider with env-based token lookup and rate-limit state.
-5. Add usage providers once their local data sources are clear.
+Providers never run on the render thread. `prism-widgets-providers` spawns one
+worker thread per polled module (`start_scheduler`); each loops fetch → push →
+sleep, sending a `ModuleUpdate` into the host event loop through a calloop
+channel. The host holds a lock-free `SnapshotCache` it reads at draw time and
+mutates only from the channel callback. The clock is the exception: it is a
+pure function of the current time, so the host renders it locally on a 1-second
+tick rather than on a worker.
+
+Each provider generation carries an `epoch`. On config reload the host drops
+the old `SchedulerHandle` (signalling its workers to stop), bumps the epoch,
+and spawns a fresh generation; snapshots from workers still mid-fetch arrive
+with the retired epoch and are ignored. The host repaints a surface only when
+the display-relevant projection of its snapshots changes, so an unchanged
+GitHub status or a clock whose minute has not advanced costs no GPU work.
+
+`prism-widgets-host` stays provider-free: it knows only the `ProviderSpawner`
+closure, the opaque `ProviderHandle` it drops to stop a generation, and the
+`ModuleUpdate`s that arrive. The `--dry-run` path bypasses all of this and
+fetches once synchronously via `SnapshotStore`.
+
+## Remaining Work
+
+- Per-module threads suit a status surface's handful of modules; swap
+  `SchedulerHandle` for a bounded pool if module counts ever grow large.
+- Wire the unused `WidgetsApp` out or into use (only `WidgetsBandApp` is built).
+- Revisit the usage providers' string round-trip: structured values are
+  flattened to `State` strings and re-parsed in the UI.
 
 ## Prism IPC
 

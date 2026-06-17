@@ -3,8 +3,11 @@ mod config;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use prism_widgets_host::{run_layer_shell_with_reload, ConfigReloader, HostConfig, PanelRunner};
-use prism_widgets_providers::SnapshotStore;
+use prism_widgets_host::{
+    run_layer_shell_with_reload, ConfigReloader, HostConfig, PanelRunner, ProviderHandle,
+    ProviderSpawner,
+};
+use prism_widgets_providers::{start_scheduler, SnapshotStore};
 
 use crate::config::Config;
 
@@ -43,19 +46,20 @@ fn main() -> Result<()> {
 
     let config = load_config(config_path.as_ref())?;
     let initial_host_config = build_host_config(&config);
-    let store = SnapshotStore::from_specs(&initial_host_config.panels);
     if !args.dry_run {
+        let spawner: ProviderSpawner = Box::new(|specs, sender, epoch| {
+            Box::new(start_scheduler(specs, sender, epoch)) as Box<dyn ProviderHandle>
+        });
         let reloader = config_path.map(|path| {
             ConfigReloader::new(path.clone(), move || {
                 let config = Config::load_from_path(&path)?;
-                let host_config = build_host_config(&config);
-                let store = SnapshotStore::from_specs(&host_config.panels);
-                Ok((host_config, Box::new(store)))
+                Ok(build_host_config(&config))
             })
         });
-        return run_layer_shell_with_reload(initial_host_config, Box::new(store), reloader);
+        return run_layer_shell_with_reload(initial_host_config, spawner, reloader);
     }
 
+    let store = SnapshotStore::from_specs(&initial_host_config.panels);
     let runner = PanelRunner::new(initial_host_config);
     for snapshot in runner.snapshots(&store) {
         println!("panel {}", snapshot.panel_id.0);

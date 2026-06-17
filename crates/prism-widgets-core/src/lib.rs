@@ -254,3 +254,65 @@ pub enum ModuleStatus {
     Critical,
     Unknown,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn clock(id: &str) -> ModuleSpec {
+        ModuleSpec::Clock(ClockSpec {
+            id: id.into(),
+            format: "%H:%M".into(),
+        })
+    }
+
+    fn command(id: &str, interval: Duration) -> ModuleSpec {
+        ModuleSpec::Command(CommandSpec {
+            id: id.into(),
+            exec: "true".into(),
+            interval,
+        })
+    }
+
+    #[test]
+    fn clock_modules_are_not_polled_but_others_are() {
+        assert_eq!(clock("c").poll_interval(), None);
+        assert_eq!(
+            command("cmd", Duration::from_secs(30)).poll_interval(),
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(clock("c").id(), "c");
+        assert_eq!(command("cmd", Duration::from_secs(1)).id(), "cmd");
+    }
+
+    #[test]
+    fn display_eq_ignores_freshness_timestamps() {
+        let base = ModuleSnapshot {
+            id: "m".into(),
+            title: "t".into(),
+            value: ModuleValue::Text("19:04".into()),
+            status: ModuleStatus::Ok,
+            updated_at: Some(SystemTime::now()),
+            stale_after: None,
+        };
+        let later = ModuleSnapshot {
+            updated_at: Some(SystemTime::now() + Duration::from_secs(60)),
+            stale_after: Some(Duration::from_secs(5)),
+            ..base.clone()
+        };
+        assert!(base.display_eq(&later), "same paint, different timestamps");
+
+        let changed = ModuleSnapshot {
+            value: ModuleValue::Text("19:05".into()),
+            ..base.clone()
+        };
+        assert!(!base.display_eq(&changed), "different value must differ");
+    }
+
+    #[test]
+    fn loading_placeholder_is_unknown() {
+        let placeholder = ModuleSnapshot::loading("m", "title");
+        assert_eq!(placeholder.status, ModuleStatus::Unknown);
+        assert!(placeholder.updated_at.is_none());
+    }
+}

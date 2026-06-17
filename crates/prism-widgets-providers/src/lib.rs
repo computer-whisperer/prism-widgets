@@ -7,18 +7,32 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Mutex;
-use std::time::{Duration, SystemTime};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant, SystemTime};
 
 use base64::Engine;
 use prism_widgets_core::{
-    ClockSpec, CommandSpec, GitHubSpec, ModuleSnapshot, ModuleSpec, ModuleStatus, ModuleValue,
-    PanelId, PanelSnapshot, PanelSpec, UsageSpec,
+    clock_snapshot, CommandSpec, GitHubSpec, ModuleSnapshot, ModuleSpec, ModuleStatus, ModuleUpdate,
+    ModuleValue, PanelId, PanelSnapshot, PanelSpec, UsageSpec,
 };
-use prism_widgets_host::PanelDataSource;
+use prism_widgets_host::{PanelDataSource, ProviderHandle, SnapshotSender};
 use serde_json::Value;
 
 const COMMAND_TIMEOUT: &str = "10s";
+const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const HTTP_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Shared HTTP agent with bounded timeouts. Without these a hung connection
+/// would keep a worker thread (and the snapshot it owes) alive indefinitely,
+/// including past a config reload that tried to retire it.
+static HTTP: LazyLock<ureq::Agent> = LazyLock::new(|| {
+    ureq::AgentBuilder::new()
+        .timeout_connect(HTTP_CONNECT_TIMEOUT)
+        .timeout(HTTP_TIMEOUT)
+        .build()
+});
 const CLAUDE_USAGE_BASE_URL: &str = "https://api.anthropic.com";
 const CLAUDE_USAGE_BETA: &str = "oauth-2025-04-20";
 const CODEX_REFRESH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
@@ -67,6 +81,110 @@ impl PanelDataSource for SnapshotStore {
     }
 }
 
+/// A running provider generation: one worker thread per polled module.
+///
+/// Per-module threads (rather than a shared pool) give the best isolation for
+/// a status surface's handful of modules — a slow or hung fetch only delays
+/// its own module, never another. If module counts ever grow large enough to
+/// make a thread-per-module wasteful, this handle is the seam to swap in a
+/// bounded pool without touching the host.
+///
+/// Dropping the handle signals shutdown and detaches: workers exit after their
+/// current fetch returns (bounded by the HTTP/command timeout), and any
+/// snapshot pushed afterwards is dropped by the host as it carries the retired
+/// epoch.
+pub struct SchedulerHandle {
+    shutdown: Arc<AtomicBool>,
+    workers: Vec<JoinHandle<()>>,
+}
+
+impl ProviderHandle for SchedulerHandle {}
+
+impl Drop for SchedulerHandle {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Release);
+        for worker in &self.workers {
+            worker.thread().unpark();
+        }
+        // Intentionally not joined: a worker mid-fetch must not block the host
+        // (and thus config reload) until its network call returns.
+    }
+}
+
+/// Spawn a worker per polled module, pushing snapshots into `sender` tagged
+/// with `epoch`. Clock modules are skipped — the host renders them locally.
+pub fn start_scheduler(specs: &[PanelSpec], sender: SnapshotSender, epoch: u64) -> SchedulerHandle {
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let mut workers = Vec::new();
+    for panel in specs {
+        for module in &panel.modules {
+            let Some(interval) = module.poll_interval() else {
+                continue;
+            };
+            let panel_id = panel.id.clone();
+            let module_id = module.id().to_string();
+            let spec = module.clone();
+            let sender = sender.clone();
+            let shutdown = Arc::clone(&shutdown);
+            workers.push(thread::spawn(move || {
+                poll_module(&spec, panel_id, module_id, interval, epoch, &sender, &shutdown);
+            }));
+        }
+    }
+    SchedulerHandle { shutdown, workers }
+}
+
+fn poll_module(
+    spec: &ModuleSpec,
+    panel: PanelId,
+    module: String,
+    interval: Duration,
+    epoch: u64,
+    sender: &SnapshotSender,
+    shutdown: &AtomicBool,
+) {
+    while !shutdown.load(Ordering::Acquire) {
+        let snapshot = fetch_module(spec);
+        let update = ModuleUpdate {
+            epoch,
+            panel: panel.clone(),
+            module: module.clone(),
+            snapshot,
+        };
+        if sender.send(update).is_err() {
+            return; // host event loop is gone
+        }
+        if !park_until(Instant::now() + interval, shutdown) {
+            return;
+        }
+    }
+}
+
+/// Sleep until `deadline`, waking promptly on shutdown. Returns `false` when
+/// shutdown was requested, `true` when the deadline elapsed normally.
+fn park_until(deadline: Instant, shutdown: &AtomicBool) -> bool {
+    loop {
+        if shutdown.load(Ordering::Acquire) {
+            return false;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return true;
+        }
+        thread::park_timeout(deadline - now);
+    }
+}
+
+/// Synchronously fetch one module. Runs on a worker thread, never the host.
+fn fetch_module(spec: &ModuleSpec) -> ModuleSnapshot {
+    match spec {
+        ModuleSpec::Clock(spec) => clock_snapshot(spec),
+        ModuleSpec::Command(spec) => command_snapshot(spec),
+        ModuleSpec::GitHub(spec) => github_snapshot(spec),
+        ModuleSpec::Usage(spec) => usage_snapshot(spec),
+    }
+}
+
 impl SnapshotStore {
     fn module_snapshot(&self, panel: &PanelSpec, spec: &ModuleSpec) -> ModuleSnapshot {
         if let ModuleSpec::Clock(spec) = spec {
@@ -106,23 +224,7 @@ impl SnapshotStore {
 }
 
 fn module_id_interval(spec: &ModuleSpec) -> (&str, Duration) {
-    match spec {
-        ModuleSpec::Clock(spec) => (&spec.id, Duration::ZERO),
-        ModuleSpec::Command(spec) => (&spec.id, spec.interval),
-        ModuleSpec::GitHub(spec) => (&spec.id, spec.interval),
-        ModuleSpec::Usage(spec) => (&spec.id, spec.interval),
-    }
-}
-
-fn clock_snapshot(spec: &ClockSpec) -> ModuleSnapshot {
-    ModuleSnapshot {
-        id: spec.id.clone(),
-        title: "clock".into(),
-        value: ModuleValue::Text(chrono::Local::now().format(&spec.format).to_string()),
-        status: ModuleStatus::Ok,
-        updated_at: Some(SystemTime::now()),
-        stale_after: None,
-    }
+    (spec.id(), spec.poll_interval().unwrap_or(Duration::ZERO))
 }
 
 fn command_snapshot(spec: &CommandSpec) -> ModuleSnapshot {
@@ -525,7 +627,8 @@ fn fetch_codex_usage(spec: &UsageSpec) -> Result<CodexUsage, String> {
     let mut auth = CodexAuthState::load(spec)?;
     auth.ensure_fresh()?;
     let account_header_sent = auth.account_id().is_some();
-    let mut request = ureq::get(CODEX_WHAM_USAGE_URL)
+    let mut request = HTTP
+        .get(CODEX_WHAM_USAGE_URL)
         .set("User-Agent", "prism-widgets")
         .set("Authorization", &format!("Bearer {}", auth.access_token()));
     if let Some(account_id) = auth.account_id() {
@@ -787,7 +890,8 @@ fn fetch_claude_usage(spec: &UsageSpec) -> Result<ClaudeUsage, String> {
         .unwrap_or(CLAUDE_USAGE_BASE_URL)
         .trim_end_matches('/');
     let url = format!("{base_url}/api/oauth/usage");
-    let mut request = ureq::get(&url)
+    let mut request = HTTP
+        .get(&url)
         .set("Content-Type", "application/json")
         .set("User-Agent", "prism-widgets")
         .set("anthropic-beta", CLAUDE_USAGE_BETA);
@@ -896,7 +1000,8 @@ impl CodexAuthState {
             "grant_type": "refresh_token",
             "refresh_token": refresh_token,
         });
-        let response = match ureq::post(CODEX_REFRESH_TOKEN_URL)
+        let response = match HTTP
+            .post(CODEX_REFRESH_TOKEN_URL)
             .set("Content-Type", "application/json")
             .send_string(&body.to_string())
         {

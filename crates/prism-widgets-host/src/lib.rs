@@ -16,7 +16,9 @@ use raw_window_handle::{
 use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState};
 use smithay_client_toolkit::output::{OutputHandler, OutputState};
 use smithay_client_toolkit::reexports::calloop::{
-    generic::Generic, EventLoop, Interest, Mode, PostAction,
+    channel::{channel, Event as ChannelEvent},
+    generic::Generic,
+    EventLoop, Interest, Mode, PostAction,
 };
 use smithay_client_toolkit::reexports::calloop_wayland_source::WaylandSource;
 use smithay_client_toolkit::registry::{ProvidesRegistryState, RegistryState};
@@ -36,12 +38,37 @@ use damascene_core::prelude::{App, Rect, Theme};
 use damascene_core::BuildCx;
 use damascene_wgpu::{MsaaTarget, Runner, RunnerCaps};
 
-use prism_widgets_core::{PanelAnchor, PanelId, PanelLayer, PanelLayout, PanelSnapshot, PanelSpec};
+use prism_widgets_core::{
+    clock_snapshot, ModuleSnapshot, ModuleSpec, ModuleUpdate, PanelAnchor, PanelId, PanelLayer,
+    PanelLayout, PanelSnapshot, PanelSpec,
+};
 use prism_widgets_ui::{PanelView, WidgetsBandApp};
 
+/// Cross-thread sender used by provider workers to push snapshots into the
+/// host event loop. Re-exported so provider crates do not need a direct
+/// calloop dependency.
+pub use smithay_client_toolkit::reexports::calloop::channel::Sender;
+
 const MSAA_SAMPLES: u32 = 4;
-const SNAPSHOT_POLL: Duration = Duration::from_secs(1);
+const CLOCK_TICK: Duration = Duration::from_secs(1);
 const CONFIG_RELOAD_DEBOUNCE: Duration = Duration::from_millis(150);
+
+/// Channel sender handed to provider workers.
+pub type SnapshotSender = Sender<ModuleUpdate>;
+
+/// Spawns a provider generation against a set of panel specs, pushing
+/// snapshots into the given sender tagged with the given epoch. The returned
+/// handle owns the worker threads; dropping it shuts that generation down.
+///
+/// This is the only seam between the provider-free host and the provider
+/// crate: the host calls it on startup and on every reload, and never learns
+/// what the providers actually do.
+pub type ProviderSpawner =
+    Box<dyn Fn(&[PanelSpec], SnapshotSender, u64) -> Box<dyn ProviderHandle>>;
+
+/// Opaque handle to a running provider generation. Dropping it must stop the
+/// generation's workers (after any in-flight fetch completes).
+pub trait ProviderHandle {}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct HostConfig {
@@ -65,15 +92,82 @@ pub trait PanelDataSource {
     fn snapshot_for(&self, panel_id: &PanelId) -> PanelSnapshot;
 }
 
+/// Latest snapshots assembled by the host, populated from worker threads via
+/// the snapshot channel. Reads are lock-free: this lives on the event-loop
+/// thread and is only mutated by channel callbacks, never by providers.
+///
+/// Clock modules are rendered on read from the current time; all other
+/// modules are served from the last value a worker pushed, falling back to a
+/// loading placeholder until the first fetch lands.
+struct SnapshotCache {
+    panels: HashMap<String, PanelSpec>,
+    modules: HashMap<(String, String), ModuleSnapshot>,
+}
+
+impl SnapshotCache {
+    fn from_specs(specs: &[PanelSpec]) -> Self {
+        let panels = specs
+            .iter()
+            .map(|panel| (panel.id.0.clone(), panel.clone()))
+            .collect();
+        Self {
+            panels,
+            modules: HashMap::new(),
+        }
+    }
+
+    /// Apply a worker update, returning whether it changed what would be drawn.
+    fn apply(&mut self, update: ModuleUpdate) -> bool {
+        let key = (update.panel.0, update.module);
+        let changed = self
+            .modules
+            .get(&key)
+            .is_none_or(|old| !old.display_eq(&update.snapshot));
+        self.modules.insert(key, update.snapshot);
+        changed
+    }
+}
+
+impl PanelDataSource for SnapshotCache {
+    fn snapshot_for(&self, panel_id: &PanelId) -> PanelSnapshot {
+        self.panels
+            .get(&panel_id.0)
+            .map(|panel| PanelSnapshot {
+                panel_id: panel.id.clone(),
+                modules: panel
+                    .modules
+                    .iter()
+                    .map(|spec| match spec {
+                        ModuleSpec::Clock(clock) => clock_snapshot(clock),
+                        _ => self
+                            .modules
+                            .get(&(panel.id.0.clone(), spec.id().to_string()))
+                            .cloned()
+                            .unwrap_or_else(|| ModuleSnapshot::loading(spec.id(), spec.id())),
+                    })
+                    .collect(),
+            })
+            .unwrap_or_else(|| PanelSnapshot::empty(panel_id.clone()))
+    }
+}
+
+fn config_has_clock(config: &HostConfig) -> bool {
+    config
+        .panels
+        .iter()
+        .flat_map(|panel| &panel.modules)
+        .any(|module| matches!(module, ModuleSpec::Clock(_)))
+}
+
 pub struct ConfigReloader {
     path: PathBuf,
-    reload: Box<dyn FnMut() -> Result<(HostConfig, Box<dyn PanelDataSource>)>>,
+    reload: Box<dyn FnMut() -> Result<HostConfig>>,
 }
 
 impl ConfigReloader {
     pub fn new(
         path: impl Into<PathBuf>,
-        reload: impl FnMut() -> Result<(HostConfig, Box<dyn PanelDataSource>)> + 'static,
+        reload: impl FnMut() -> Result<HostConfig> + 'static,
     ) -> Self {
         Self {
             path: path.into(),
@@ -112,19 +206,23 @@ impl PanelRunner {
 ///
 /// This is intentionally provider-free: callers supply a data source,
 /// and this host only turns panel specs plus snapshots into surfaces.
-pub fn run_layer_shell(config: HostConfig, source: Box<dyn PanelDataSource>) -> Result<()> {
-    run_layer_shell_with_reload(config, source, None)
+pub fn run_layer_shell(config: HostConfig, spawner: ProviderSpawner) -> Result<()> {
+    run_layer_shell_with_reload(config, spawner, None)
 }
 
 pub fn run_layer_shell_with_reload(
     config: HostConfig,
-    source: Box<dyn PanelDataSource>,
+    spawner: ProviderSpawner,
     reloader: Option<ConfigReloader>,
 ) -> Result<()> {
     let conn = Connection::connect_to_env().context("connect to wayland")?;
     let (globals, event_queue) =
         registry_queue_init::<LayerHost>(&conn).context("registry init")?;
     let qh = event_queue.handle();
+
+    let (sender, snapshots) = channel::<ModuleUpdate>();
+    let cache = SnapshotCache::from_specs(&config.panels);
+    let next_clock_tick = config_has_clock(&config).then(|| Instant::now() + CLOCK_TICK);
 
     let mut host = LayerHost {
         registry_state: RegistryState::new(&globals),
@@ -133,14 +231,17 @@ pub fn run_layer_shell_with_reload(
         layer_shell: LayerShell::bind(&globals, &qh).context("zwlr_layer_shell_v1")?,
         conn: conn.clone(),
         config,
-        source,
+        cache,
+        spawner,
+        sender,
+        provider_handle: None,
+        current_epoch: 0,
         reloader,
         instance: wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle()),
         gpu: None,
         surfaces: Vec::new(),
-        dirty: false,
         reload_at: None,
-        next_snapshot_poll: Instant::now() + SNAPSHOT_POLL,
+        next_clock_tick,
         exit: false,
     };
 
@@ -151,39 +252,43 @@ pub fn run_layer_shell_with_reload(
     if let Some(reloader) = host.reloader.as_ref() {
         watch_config(&mut event_loop, &reloader.path)?;
     }
+    event_loop
+        .handle()
+        .insert_source(snapshots, |event, _, host: &mut LayerHost| {
+            if let ChannelEvent::Msg(update) = event {
+                host.on_module_update(update);
+            }
+        })
+        .map_err(|e| anyhow::anyhow!("insert snapshot channel: {e}"))?;
+
+    // Start the first provider generation now that the channel is live.
+    host.spawn_providers();
 
     while !host.exit {
         let now = Instant::now();
-        let mut timeout = host.next_snapshot_poll.saturating_duration_since(now);
+        let mut timeout = host
+            .next_clock_tick
+            .map(|deadline| deadline.saturating_duration_since(now));
         if let Some(deadline) = host.reload_at {
-            timeout = timeout.min(deadline.saturating_duration_since(now));
+            timeout = Some(min_timeout(timeout, deadline.saturating_duration_since(now)));
         }
         for surface in &host.surfaces {
             if let Some(deadline) = surface.anim_deadline {
-                timeout = timeout.min(deadline.saturating_duration_since(now));
+                timeout = Some(min_timeout(timeout, deadline.saturating_duration_since(now)));
             }
         }
 
         event_loop
-            .dispatch(Some(timeout), &mut host)
+            .dispatch(timeout, &mut host)
             .context("event loop dispatch")?;
 
         let now = Instant::now();
-        if host.next_snapshot_poll <= now {
-            host.next_snapshot_poll = now + SNAPSHOT_POLL;
-            for surface in &mut host.surfaces {
-                surface.dirty = true;
-            }
+        if host.next_clock_tick.is_some_and(|tick| tick <= now) {
+            host.next_clock_tick = Some(now + CLOCK_TICK);
         }
         if host.reload_at.is_some_and(|deadline| deadline <= now) {
             host.reload_at = None;
             host.reload_config(&qh);
-        }
-        if host.dirty {
-            host.dirty = false;
-            for surface in &mut host.surfaces {
-                surface.dirty = true;
-            }
         }
         for surface in &mut host.surfaces {
             if surface
@@ -195,13 +300,16 @@ pub fn run_layer_shell_with_reload(
             }
         }
         for i in 0..host.surfaces.len() {
-            if host.surfaces[i].dirty {
-                host.draw(i);
-            }
+            host.refresh_and_draw(i);
         }
     }
 
     Ok(())
+}
+
+/// Smallest of an optional running timeout and a candidate deadline.
+fn min_timeout(current: Option<Duration>, candidate: Duration) -> Duration {
+    current.map_or(candidate, |current| current.min(candidate))
 }
 
 struct GpuShared {
@@ -231,6 +339,8 @@ struct PanelSurface {
     scale: i32,
     dirty: bool,
     anim_deadline: Option<Instant>,
+    // Last snapshots painted to this surface, for redraw suppression.
+    last_snapshots: Vec<PanelSnapshot>,
 }
 
 struct LayerHost {
@@ -240,14 +350,17 @@ struct LayerHost {
     layer_shell: LayerShell,
     conn: Connection,
     config: HostConfig,
-    source: Box<dyn PanelDataSource>,
+    cache: SnapshotCache,
+    spawner: ProviderSpawner,
+    sender: SnapshotSender,
+    provider_handle: Option<Box<dyn ProviderHandle>>,
+    current_epoch: u64,
     reloader: Option<ConfigReloader>,
     instance: wgpu::Instance,
     gpu: Option<GpuShared>,
     surfaces: Vec<PanelSurface>,
-    dirty: bool,
     reload_at: Option<Instant>,
-    next_snapshot_poll: Instant,
+    next_clock_tick: Option<Instant>,
     exit: bool,
 }
 
@@ -333,6 +446,7 @@ impl LayerHost {
             scale: 1,
             dirty: false,
             anim_deadline: None,
+            last_snapshots: Vec::new(),
         });
     }
 
@@ -352,7 +466,22 @@ impl LayerHost {
         );
     }
 
-    fn draw(&mut self, i: usize) {
+    /// Assemble this surface's snapshots, and redraw only when the result
+    /// differs from what is currently painted (or a redraw is forced).
+    fn refresh_and_draw(&mut self, i: usize) {
+        let snapshots: Vec<PanelSnapshot> = self.surfaces[i]
+            .panels
+            .iter()
+            .map(|panel| self.cache.snapshot_for(&panel.id))
+            .collect();
+        let changed = !snapshots_display_eq(&snapshots, &self.surfaces[i].last_snapshots);
+        if self.surfaces[i].dirty || changed {
+            self.surfaces[i].last_snapshots = snapshots.clone();
+            self.draw(i, snapshots);
+        }
+    }
+
+    fn draw(&mut self, i: usize, snapshots: Vec<PanelSnapshot>) {
         let gpu = self.gpu.as_ref().expect("gpu exists once surfaces do");
         let surface = &mut self.surfaces[i];
         surface.dirty = false;
@@ -360,10 +489,9 @@ impl LayerHost {
             return;
         };
 
-        surface.app.set_views(panel_views_from_source(
-            self.source.as_ref(),
-            &surface.panels,
-        ));
+        surface
+            .app
+            .set_views(panel_views_from_snapshots(&surface.panels, &snapshots));
         let outcome = render_frame(
             gpu,
             &surface.wgpu_surface,
@@ -428,15 +556,41 @@ impl LayerHost {
     }
 
     fn panel_views(&self, panels: &[PanelSpec]) -> Vec<PanelView> {
-        panel_views_from_source(self.source.as_ref(), panels)
+        let snapshots: Vec<PanelSnapshot> = panels
+            .iter()
+            .map(|panel| self.cache.snapshot_for(&panel.id))
+            .collect();
+        panel_views_from_snapshots(panels, &snapshots)
+    }
+
+    /// Drop the current provider generation (stopping its workers) and start a
+    /// fresh one for the current config under the current epoch.
+    fn spawn_providers(&mut self) {
+        self.provider_handle = None;
+        self.provider_handle = Some((self.spawner)(
+            &self.config.panels,
+            self.sender.clone(),
+            self.current_epoch,
+        ));
+    }
+
+    fn on_module_update(&mut self, update: ModuleUpdate) {
+        // Drop results from a provider generation that a reload has retired;
+        // a worker still mid-fetch when the config changed lands here.
+        if update.epoch != self.current_epoch {
+            return;
+        }
+        // The draw phase re-assembles and diffs every loop iteration, so the
+        // updated cache repaints on this same wake if it changed anything.
+        self.cache.apply(update);
     }
 
     fn reload_config(&mut self, qh: &QueueHandle<Self>) {
         let Some(reloader) = self.reloader.as_mut() else {
             return;
         };
-        let (config, source) = match (reloader.reload)() {
-            Ok(reloaded) => reloaded,
+        let config = match (reloader.reload)() {
+            Ok(config) => config,
             Err(err) => {
                 tracing::error!("config reload failed; keeping current config\n{err:#}");
                 return;
@@ -444,8 +598,11 @@ impl LayerHost {
         };
 
         tracing::info!("config reloaded");
+        self.current_epoch += 1;
+        self.cache = SnapshotCache::from_specs(&config.panels);
+        self.next_clock_tick = config_has_clock(&config).then(|| Instant::now() + CLOCK_TICK);
         self.config = config;
-        self.source = source;
+        self.spawn_providers();
         self.surfaces.clear();
         let outputs: Vec<_> = self.output_state.outputs().collect();
         for output in outputs {
@@ -454,7 +611,6 @@ impl LayerHost {
             };
             self.create_wanted_panels_for_output(qh, output, name);
         }
-        self.dirty = true;
     }
 }
 
@@ -659,19 +815,35 @@ fn panel_label(panels: &[PanelSpec]) -> String {
         .join("+")
 }
 
-fn panel_views_from_source(source: &dyn PanelDataSource, panels: &[PanelSpec]) -> Vec<PanelView> {
+fn panel_views_from_snapshots(panels: &[PanelSpec], snapshots: &[PanelSnapshot]) -> Vec<PanelView> {
     panels
         .iter()
-        .map(|panel| {
+        .zip(snapshots)
+        .map(|(panel, snapshot)| {
             PanelView::new(
                 panel.appearance.clone(),
                 panel.geometry.anchor,
                 panel.layout,
                 panel.geometry.width,
-                source.snapshot_for(&panel.id),
+                snapshot.clone(),
             )
         })
         .collect()
+}
+
+/// Whether two sets of panel snapshots paint identically, ignoring freshness
+/// timestamps (see [`ModuleSnapshot::display_eq`]).
+fn snapshots_display_eq(a: &[PanelSnapshot], b: &[PanelSnapshot]) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b).all(|(left, right)| {
+            left.panel_id == right.panel_id
+                && left.modules.len() == right.modules.len()
+                && left
+                    .modules
+                    .iter()
+                    .zip(&right.modules)
+                    .all(|(left, right)| left.display_eq(right))
+        })
 }
 
 fn layer_of(layer: PanelLayer) -> Layer {
@@ -1016,5 +1188,121 @@ fn render_frame<A: App>(
     FrameOutcome {
         retry: false,
         anim_deadline,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::SystemTime;
+
+    use prism_widgets_core::{
+        ClockSpec, CommandSpec, ModuleStatus, ModuleValue, PanelAppearance, PanelGeometry,
+        ThemeName,
+    };
+
+    fn panel(id: &str, modules: Vec<ModuleSpec>) -> PanelSpec {
+        PanelSpec {
+            id: PanelId::new(id),
+            output: None,
+            layout: PanelLayout::Bar,
+            geometry: PanelGeometry {
+                width: None,
+                height: 1,
+                margin: 0,
+                exclusive_zone: -1,
+                anchor: PanelAnchor::TopRight,
+                layer: PanelLayer::Top,
+            },
+            appearance: PanelAppearance {
+                opacity: 1.0,
+                radius: 0.0,
+                border: false,
+                show_header: false,
+                theme: ThemeName::Dark,
+            },
+            modules,
+        }
+    }
+
+    fn clock(id: &str) -> ModuleSpec {
+        ModuleSpec::Clock(ClockSpec {
+            id: id.into(),
+            format: "%H:%M".into(),
+        })
+    }
+
+    fn command(id: &str) -> ModuleSpec {
+        ModuleSpec::Command(CommandSpec {
+            id: id.into(),
+            exec: "true".into(),
+            interval: Duration::from_secs(60),
+        })
+    }
+
+    fn cmd_state(label: &str) -> ModuleSnapshot {
+        ModuleSnapshot {
+            id: "cmd".into(),
+            title: "cmd".into(),
+            value: ModuleValue::State {
+                label: label.into(),
+                detail: None,
+            },
+            status: ModuleStatus::Ok,
+            updated_at: Some(SystemTime::now()),
+            stale_after: None,
+        }
+    }
+
+    fn update(snapshot: ModuleSnapshot) -> ModuleUpdate {
+        ModuleUpdate {
+            epoch: 0,
+            panel: PanelId::new("p"),
+            module: "cmd".into(),
+            snapshot,
+        }
+    }
+
+    #[test]
+    fn clock_renders_live_while_unfetched_modules_show_a_placeholder() {
+        let spec = panel("p", vec![clock("clk"), command("cmd")]);
+        let cache = SnapshotCache::from_specs(std::slice::from_ref(&spec));
+        let snapshot = cache.snapshot_for(&PanelId::new("p"));
+
+        assert_eq!(snapshot.modules.len(), 2);
+        assert_eq!(snapshot.modules[0].id, "clk");
+        assert!(matches!(snapshot.modules[0].value, ModuleValue::Text(_)));
+        assert_eq!(snapshot.modules[1].status, ModuleStatus::Unknown);
+    }
+
+    #[test]
+    fn apply_serves_latest_value_and_reports_display_changes() {
+        let spec = panel("p", vec![command("cmd")]);
+        let mut cache = SnapshotCache::from_specs(std::slice::from_ref(&spec));
+
+        assert!(cache.apply(update(cmd_state("ok"))), "first value is a change");
+        assert_eq!(
+            cache.snapshot_for(&PanelId::new("p")).modules[0].value,
+            ModuleValue::State {
+                label: "ok".into(),
+                detail: None,
+            }
+        );
+        // Same paint, newer timestamp → not a change.
+        assert!(!cache.apply(update(cmd_state("ok"))));
+        // Different label → a change.
+        assert!(cache.apply(update(cmd_state("fail"))));
+    }
+
+    #[test]
+    fn snapshots_display_eq_ignores_timestamps() {
+        let snapshots = |label: &str| {
+            vec![PanelSnapshot {
+                panel_id: PanelId::new("p"),
+                modules: vec![cmd_state(label)],
+            }]
+        };
+        assert!(snapshots_display_eq(&snapshots("ok"), &snapshots("ok")));
+        assert!(!snapshots_display_eq(&snapshots("ok"), &snapshots("changed")));
     }
 }

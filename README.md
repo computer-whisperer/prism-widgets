@@ -4,9 +4,9 @@ Configurable Damascene `wlr-layer-shell` information panels for status surfaces
 that do not belong in the primary `prism-bar`.
 
 The project starts from the same architectural spine as `prism-bar`: Damascene
-for GPU UI, `wlr-layer-shell` surfaces, and KDL config. The current host opens
-real layer-shell panels with placeholder provider snapshots; provider polling
-and live reload are next.
+for GPU UI, `wlr-layer-shell` surfaces, and KDL config. The host opens real
+layer-shell panels, polls providers on background worker threads, repaints only
+when a snapshot actually changes, and reloads the config live.
 
 The important dependency boundary is provider isolation. A future common runner
 shared with `prism-bar` must not depend on GitHub, subscription-usage APIs, or
