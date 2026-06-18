@@ -21,9 +21,13 @@ optdepends=(
     'github-cli: github module status via `gh api`'
 )
 makedepends=('cargo')
+# Disable system LTO — Arch's default `-flto=auto` lands in CFLAGS and makes
+# ring's C/asm sources (pulled in via ureq's rustls TLS for the usage
+# providers) emit LTO-IR objects that rust-lld can't resolve at the final
+# Rust link step.
+options=('!lto')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-# Run `updpkgsums` once the v0.1.0 tag exists on GitHub.
-sha256sums=('SKIP')
+sha256sums=('0a56b4e0bb9a533d908bd782b26259b799b92e2e54e6803bfb2fc71ee4ccd4c6')
 
 prepare() {
     cd "$pkgname-$pkgver"
