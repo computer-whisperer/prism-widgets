@@ -120,3 +120,24 @@ cargo run -p prism-widgets
 ```
 
 The non-dry-run path requires a Wayland compositor with `wlr-layer-shell`.
+
+## Building
+
+```
+cargo build --release
+```
+
+A wgpu-capable GPU (Vulkan on Linux) and system libwayland are required for the
+live path — wgpu's WSI needs raw `wl_display`/`wl_surface` pointers. An
+AUR-oriented `PKGBUILD` is provided for tagged releases; it installs the
+`prism-widgets` binary, this README, and the license files.
+
+## License
+
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
+[MIT license](LICENSE-MIT) at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally
+submitted for inclusion in the work by you, as defined in the Apache-2.0
+license, shall be dual licensed as above, without any additional terms or
+conditions.
