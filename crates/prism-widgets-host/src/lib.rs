@@ -270,11 +270,17 @@ pub fn run_layer_shell_with_reload(
             .next_clock_tick
             .map(|deadline| deadline.saturating_duration_since(now));
         if let Some(deadline) = host.reload_at {
-            timeout = Some(min_timeout(timeout, deadline.saturating_duration_since(now)));
+            timeout = Some(min_timeout(
+                timeout,
+                deadline.saturating_duration_since(now),
+            ));
         }
         for surface in &host.surfaces {
             if let Some(deadline) = surface.anim_deadline {
-                timeout = Some(min_timeout(timeout, deadline.saturating_duration_since(now)));
+                timeout = Some(min_timeout(
+                    timeout,
+                    deadline.saturating_duration_since(now),
+                ));
             }
         }
 
@@ -1280,7 +1286,10 @@ mod tests {
         let spec = panel("p", vec![command("cmd")]);
         let mut cache = SnapshotCache::from_specs(std::slice::from_ref(&spec));
 
-        assert!(cache.apply(update(cmd_state("ok"))), "first value is a change");
+        assert!(
+            cache.apply(update(cmd_state("ok"))),
+            "first value is a change"
+        );
         assert_eq!(
             cache.snapshot_for(&PanelId::new("p")).modules[0].value,
             ModuleValue::State {
@@ -1303,6 +1312,9 @@ mod tests {
             }]
         };
         assert!(snapshots_display_eq(&snapshots("ok"), &snapshots("ok")));
-        assert!(!snapshots_display_eq(&snapshots("ok"), &snapshots("changed")));
+        assert!(!snapshots_display_eq(
+            &snapshots("ok"),
+            &snapshots("changed")
+        ));
     }
 }

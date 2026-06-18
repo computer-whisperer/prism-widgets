@@ -14,8 +14,9 @@ use std::time::{Duration, Instant, SystemTime};
 
 use base64::Engine;
 use prism_widgets_core::{
-    clock_snapshot, CommandSpec, GitHubSpec, ModuleSnapshot, ModuleSpec, ModuleStatus, ModuleUpdate,
-    ModuleValue, PanelId, PanelSnapshot, PanelSpec, UsageMetric, UsageValue, UsageSpec,
+    clock_snapshot, CommandSpec, GitHubSpec, ModuleSnapshot, ModuleSpec, ModuleStatus,
+    ModuleUpdate, ModuleValue, PanelId, PanelSnapshot, PanelSpec, UsageMetric, UsageSpec,
+    UsageValue,
 };
 use prism_widgets_host::{PanelDataSource, ProviderHandle, SnapshotSender};
 use serde_json::Value;
@@ -127,7 +128,9 @@ pub fn start_scheduler(specs: &[PanelSpec], sender: SnapshotSender, epoch: u64) 
             let sender = sender.clone();
             let shutdown = Arc::clone(&shutdown);
             workers.push(thread::spawn(move || {
-                poll_module(&spec, panel_id, module_id, interval, epoch, &sender, &shutdown);
+                poll_module(
+                    &spec, panel_id, module_id, interval, epoch, &sender, &shutdown,
+                );
             }));
         }
     }
