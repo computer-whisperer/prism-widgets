@@ -100,6 +100,8 @@ struct GitHubNode {
     #[knuffel(property)]
     id: Option<String>,
     #[knuffel(property)]
+    title: Option<String>,
+    #[knuffel(property)]
     branch: Option<String>,
     #[knuffel(property)]
     workflow: Option<String>,
@@ -460,6 +462,7 @@ impl ModuleNode {
             ModuleNode::Github(github) => ModuleSpec::GitHub(GitHubSpec {
                 id: github.id.clone().unwrap_or_else(|| github.repo.clone()),
                 repo: github.repo.clone(),
+                title: github.title.clone(),
                 branch: github.branch.clone(),
                 workflow: github.workflow.clone(),
                 interval: Duration::from_secs(github.interval),

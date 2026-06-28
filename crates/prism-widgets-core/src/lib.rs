@@ -172,6 +172,9 @@ pub struct CommandSpec {
 pub struct GitHubSpec {
     pub id: String,
     pub repo: String,
+    /// Display title; falls back to `repo` when unset. Lets a long
+    /// `owner/name` show as a short label instead of being ellipsized.
+    pub title: Option<String>,
     pub branch: Option<String>,
     pub workflow: Option<String>,
     pub interval: Duration,

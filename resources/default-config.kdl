@@ -110,8 +110,9 @@ panel "top-right-usage" {
 //     theme "dark"
 //
 //     modules {
-//         github repo="computer-whisperer/prism" branch="main" interval=60 token-env="GITHUB_TOKEN"
-//         github repo="computer-whisperer/damascene" workflow="ci" interval=60 token-env="GITHUB_TOKEN"
+//         // title= shortens a long owner/name so it is not ellipsized.
+//         github repo="computer-whisperer/prism" title="prism" branch="main" interval=60 token-env="GITHUB_TOKEN"
+//         github repo="computer-whisperer/damascene" title="damascene" workflow="ci" interval=60 token-env="GITHUB_TOKEN"
 //         usage source="codex" account="default" codex-home="~/.codex" interval=300
 //         usage source="claude" account="default" claude-dir="~/.claude" interval=300
 //         // Example second Codex profile:

@@ -109,6 +109,8 @@ Any other `usage` source uses the `SOURCE-usage-json` helper convention. A
 `source` containing whitespace is treated as the full command. `github` uses
 `gh api` and maps the latest Actions run into a status.
 `workflow=` accepts a workflow file/ID or filters recent runs by display name.
+`title=` overrides the displayed label, so a long `owner/name` repo can show
+as a short name instead of being ellipsized in a sidebar.
 
 `cpu`, `memory`, and `gpu` read local system load directly from `/proc` and
 `/sys` (no extra tooling) and render as stacked percentage meters with a

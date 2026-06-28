@@ -634,10 +634,15 @@ fn github_snapshot(spec: &GitHubSpec) -> ModuleSnapshot {
 
     match run_command("gh", &["api", &endpoint], &envs) {
         Ok(text) => parse_github_runs(spec, &text).unwrap_or_else(|| {
-            error_snapshot(&spec.id, &spec.repo, "no workflow runs", spec.interval)
+            error_snapshot(&spec.id, github_title(spec), "no workflow runs", spec.interval)
         }),
-        Err(err) => error_snapshot(&spec.id, &spec.repo, err, spec.interval),
+        Err(err) => error_snapshot(&spec.id, github_title(spec), err, spec.interval),
     }
+}
+
+/// Display title for a github module: the configured `title`, else the repo.
+fn github_title(spec: &GitHubSpec) -> &str {
+    spec.title.as_deref().unwrap_or(&spec.repo)
 }
 
 fn parse_github_runs(spec: &GitHubSpec, text: &str) -> Option<ModuleSnapshot> {
@@ -690,7 +695,7 @@ fn parse_github_runs(spec: &GitHubSpec, text: &str) -> Option<ModuleSnapshot> {
 
     Some(ModuleSnapshot {
         id: spec.id.clone(),
-        title: spec.repo.clone(),
+        title: github_title(spec).to_string(),
         value: ModuleValue::State { label, detail },
         status: module_status,
         updated_at: Some(SystemTime::now()),
@@ -1726,6 +1731,22 @@ mod tests {
     fn proc_stat_totals_rejects_missing_cpu_line() {
         assert!(parse_proc_stat_totals("intr 1 2 3").is_err());
         assert!(parse_proc_stat_totals("cpu 1 2").is_err());
+    }
+
+    #[test]
+    fn github_title_overrides_repo_else_falls_back() {
+        let mut spec = GitHubSpec {
+            id: "ci".into(),
+            repo: "computer-whisperer/some-very-long-repo-name".into(),
+            title: None,
+            branch: None,
+            workflow: None,
+            interval: Duration::from_secs(60),
+            token_env: None,
+        };
+        assert_eq!(github_title(&spec), "computer-whisperer/some-very-long-repo-name");
+        spec.title = Some("shortname".into());
+        assert_eq!(github_title(&spec), "shortname");
     }
 
     #[test]
