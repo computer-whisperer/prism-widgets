@@ -110,6 +110,22 @@ Any other `usage` source uses the `SOURCE-usage-json` helper convention. A
 `gh api` and maps the latest Actions run into a status.
 `workflow=` accepts a workflow file/ID or filters recent runs by display name.
 
+`cpu`, `memory`, and `gpu` read local system load directly from `/proc` and
+`/sys` (no extra tooling) and render as stacked percentage meters with a
+context detail line:
+
+```kdl
+cpu interval=3          // util% + load (1m / cores); temperature in the detail
+memory interval=5       // ram% + swap%; used / total GiB in the detail
+gpu card=0 interval=3   // amdgpu busy% + vram% (+ power% if exposed); temp · watts
+```
+
+`cpu` samples `/proc/stat` twice per refresh to derive utilization, and reports
+the 1-minute load average as a percentage of core count (over 100% means the
+machine is oversubscribed). `gpu` reads one `amdgpu` DRM card per module
+(`card=` is the `/sys/class/drm/cardN` index); the power meter is omitted on
+cards that do not expose a draw and cap, such as integrated parts.
+
 ## Running
 
 ```bash

@@ -70,6 +70,28 @@ panel "top-right-usage" {
     }
 }
 
+// Example local-system dashboard. These widgets read /proc and /sys directly
+// (no extra tooling) and render as stacked meters, so a sidebar suits them.
+//
+// panel "system" {
+//     anchor "right"
+//     layout "sidebar"
+//     width 300
+//     reserve true
+//     theme "dark"
+//
+//     modules {
+//         // util% + load (1m / cores); temperature in the detail line.
+//         cpu interval=3
+//         // ram% + swap%; used / total GiB in the detail line.
+//         memory interval=5
+//         // Per amdgpu DRM card: busy% + vram% (+ power% when exposed);
+//         // temperature and watts in the detail line. One module per card.
+//         gpu card=0 interval=3
+//         gpu card=1 interval=3
+//     }
+// }
+
 // Example right-edge status cluster for a tertiary display.
 //
 // panel "right-sidebar" {

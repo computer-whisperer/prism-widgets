@@ -88,6 +88,9 @@ pub enum ModuleSpec {
     Command(CommandSpec),
     GitHub(GitHubSpec),
     Usage(UsageSpec),
+    Cpu(CpuSpec),
+    Memory(MemorySpec),
+    Gpu(GpuSpec),
 }
 
 impl ModuleSpec {
@@ -97,6 +100,9 @@ impl ModuleSpec {
             ModuleSpec::Command(spec) => &spec.id,
             ModuleSpec::GitHub(spec) => &spec.id,
             ModuleSpec::Usage(spec) => &spec.id,
+            ModuleSpec::Cpu(spec) => &spec.id,
+            ModuleSpec::Memory(spec) => &spec.id,
+            ModuleSpec::Gpu(spec) => &spec.id,
         }
     }
 
@@ -110,6 +116,9 @@ impl ModuleSpec {
             ModuleSpec::Command(spec) => Some(spec.interval),
             ModuleSpec::GitHub(spec) => Some(spec.interval),
             ModuleSpec::Usage(spec) => Some(spec.interval),
+            ModuleSpec::Cpu(spec) => Some(spec.interval),
+            ModuleSpec::Memory(spec) => Some(spec.interval),
+            ModuleSpec::Gpu(spec) => Some(spec.interval),
         }
     }
 }
@@ -182,6 +191,31 @@ pub struct UsageSpec {
     pub interval: Duration,
 }
 
+/// Aggregate CPU pressure: utilization sampled from `/proc/stat`, plus the
+/// 1-minute load average normalized to core count. Temperature is carried in
+/// the detail line, not as a gauge.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CpuSpec {
+    pub id: String,
+    pub interval: Duration,
+}
+
+/// System memory pressure: RAM and swap utilization from `/proc/meminfo`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemorySpec {
+    pub id: String,
+    pub interval: Duration,
+}
+
+/// A single GPU's load: utilization, VRAM, and power draw read from the
+/// `amdgpu` sysfs node for the given DRM card index.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GpuSpec {
+    pub id: String,
+    pub card: u32,
+    pub interval: Duration,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct PanelSnapshot {
     pub panel_id: PanelId,
@@ -244,25 +278,27 @@ pub enum ModuleValue {
         label: String,
         detail: Option<String>,
     },
-    Usage(UsageValue),
+    Gauges(GaugeGroup),
 }
 
-/// Subscription/quota usage: one or more named percentage gauges plus
-/// non-numeric context (plan, credits, reset time).
+/// One or more named percentage gauges plus non-numeric context. Produced by
+/// any module that wants to show a handful of meters: subscription/quota usage
+/// (plan, credits, reset time in the detail) as well as CPU, memory, and GPU
+/// load (temperature, clocks, watts in the detail).
 ///
 /// Carried structured rather than pre-formatted into a label so the UI can
 /// render gauges without re-parsing percentages back out of a string — the
 /// provider owns the numbers, the UI owns their presentation.
 #[derive(Clone, Debug, PartialEq)]
-pub struct UsageValue {
+pub struct GaugeGroup {
     /// Ordered gauges; the first is the headline shown in compact layouts.
-    pub metrics: Vec<UsageMetric>,
-    /// Remaining context with no percentage of its own (plan, credits, resets).
+    pub gauges: Vec<Gauge>,
+    /// Remaining context with no percentage of its own (plan, temp, watts).
     pub detail: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct UsageMetric {
+pub struct Gauge {
     pub label: String,
     pub percent: f32,
 }

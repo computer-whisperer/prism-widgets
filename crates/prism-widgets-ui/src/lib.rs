@@ -4,8 +4,8 @@ use std::sync::LazyLock;
 
 use damascene_core::prelude::*;
 use prism_widgets_core::{
-    ModuleSnapshot, ModuleStatus, ModuleValue, PanelAnchor, PanelAppearance, PanelLayout,
-    PanelSnapshot, ThemeName, UsageMetric, UsageValue,
+    Gauge, GaugeGroup, ModuleSnapshot, ModuleStatus, ModuleValue, PanelAnchor, PanelAppearance,
+    PanelLayout, PanelSnapshot, ThemeName,
 };
 
 const GITHUB_SVG: &str = include_str!("../assets/icons/github.svg");
@@ -210,20 +210,19 @@ fn module_chip(module: &ModuleSnapshot) -> El {
                 cells.push(text(ellipsize(detail, 28)).caption().muted());
             }
         }
-        ModuleValue::Usage(usage) => {
+        ModuleValue::Gauges(group) => {
             cells.push(status_badge_with_label(
                 module.status,
-                ellipsize(&usage_headline(usage), 20),
+                ellipsize(&gauge_headline(group), 20),
             ));
-            if let Some(detail) = &usage.detail {
+            if let Some(detail) = &group.detail {
                 cells.push(text(ellipsize(detail, 28)).caption().muted());
             }
         }
         _ => {
+            // Plain values carry status through their colour: Percent/Count get
+            // a status-tinted fraction bar below, so no separate pill is needed.
             cells.push(module_value_text(module).label());
-            if !matches!(module.status, ModuleStatus::Ok) {
-                cells.push(status_badge(module.status));
-            }
         }
     }
 
@@ -248,17 +247,35 @@ fn module_chip(module: &ModuleSnapshot) -> El {
 }
 
 fn sidebar_module_item(module: &ModuleSnapshot) -> El {
-    let metrics = module_usage_metrics(module);
-    let mut header = vec![text(ellipsize(&module.title, 30)).label(), spacer()];
-    if metrics.is_empty() {
+    let gauges = module_gauges(module);
+
+    // Keep each entry as short as possible: the detail and value summary ride to
+    // the right of the title on the header row rather than wrapping onto a line
+    // of their own, which is what made entries tall on a short sidebar.
+    //
+    // The title is the flexible element: it fills the slack when there's room
+    // (pushing the trailing detail/value to the right edge) and ellipsizes when
+    // the row is tight. A trailing spacer can't do this job here because the row
+    // is often overpacked (title + detail + badge exceed the width), leaving no
+    // leftover to distribute — the badge would then stagger by title length and
+    // even overflow the panel. A Fill title instead yields its own width so the
+    // trailing cluster stays pinned right.
+    let mut header = vec![text(ellipsize(&module.title, 24))
+        .label()
+        .ellipsis()
+        .width(Size::Fill(1.0))];
+    if let Some(detail) = module_detail_text(module) {
+        header.push(text(detail).caption().muted());
+    }
+    if gauges.is_empty() {
         header.push(module_value_summary(module));
     }
 
-    let mut content = vec![row(header).gap(tokens::SPACE_2).align(Align::Center)];
-    if let Some(detail) = module_detail_text(module) {
-        content.push(text(detail).caption().muted());
-    }
-    if metrics.is_empty() {
+    let mut content = vec![row(header)
+        .gap(tokens::SPACE_2)
+        .align(Align::Center)
+        .width(Size::Fill(1.0))];
+    if gauges.is_empty() {
         if let Some(fraction) = module_fraction(module) {
             content.push(
                 progress_with_color(fraction, status_color(module.status))
@@ -267,7 +284,7 @@ fn sidebar_module_item(module: &ModuleSnapshot) -> El {
             );
         }
     } else {
-        content.extend(metrics.iter().map(usage_metric_bar));
+        content.extend(gauges.iter().map(gauge_bar));
     }
 
     let mut children = Vec::new();
@@ -275,9 +292,6 @@ fn sidebar_module_item(module: &ModuleSnapshot) -> El {
         children.push(item_media_icon(glyph));
     }
     children.push(item_content(content).gap(tokens::SPACE_2));
-    if !matches!(module.status, ModuleStatus::Ok) {
-        children.push(item_actions([status_badge(module.status)]));
-    }
     item(children)
 }
 
@@ -290,8 +304,8 @@ fn module_value_summary(module: &ModuleSnapshot) -> El {
         ModuleValue::State { label, .. } => {
             status_badge_with_label(module.status, ellipsize(label, 24))
         }
-        ModuleValue::Usage(usage) => {
-            status_badge_with_label(module.status, ellipsize(&usage_headline(usage), 24))
+        ModuleValue::Gauges(group) => {
+            status_badge_with_label(module.status, ellipsize(&gauge_headline(group), 24))
         }
         _ => text(module_value_plain(module)).label(),
     }
@@ -306,51 +320,51 @@ fn module_value_plain(module: &ModuleSnapshot) -> String {
             None => current.to_string(),
         },
         ModuleValue::State { label, .. } => ellipsize(label, 36),
-        ModuleValue::Usage(usage) => ellipsize(&usage_headline(usage), 36),
+        ModuleValue::Gauges(group) => ellipsize(&gauge_headline(group), 36),
     }
 }
 
 fn module_detail_text(module: &ModuleSnapshot) -> Option<String> {
     let detail = match &module.value {
-        ModuleValue::Usage(usage) => usage.detail.as_deref(),
+        ModuleValue::Gauges(group) => group.detail.as_deref(),
         ModuleValue::State { detail, .. } => detail.as_deref(),
         _ => None,
     }?;
-    (!detail.is_empty()).then(|| ellipsize(detail, 56))
+    (!detail.is_empty()).then(|| ellipsize(detail, 40))
 }
 
-/// The metric gauges to draw as bars: a usage value's windows, or none for
-/// other module kinds (which fall back to a single fraction bar).
-fn module_usage_metrics(module: &ModuleSnapshot) -> &[UsageMetric] {
+/// The gauges to draw as bars: a gauge group's entries, or none for other
+/// module kinds (which fall back to a single fraction bar).
+fn module_gauges(module: &ModuleSnapshot) -> &[Gauge] {
     match &module.value {
-        ModuleValue::Usage(usage) => &usage.metrics,
+        ModuleValue::Gauges(group) => &group.gauges,
         _ => &[],
     }
 }
 
-/// Compact one-line summary of a usage value: its headline (first) gauge.
-fn usage_headline(usage: &UsageValue) -> String {
-    usage
-        .metrics
+/// Compact one-line summary of a gauge group: its headline (first) gauge.
+fn gauge_headline(group: &GaugeGroup) -> String {
+    group
+        .gauges
         .first()
-        .map(|metric| format!("{} {}", metric.label, format_percent(metric.percent)))
-        .unwrap_or_else(|| "usage".into())
+        .map(|gauge| format!("{} {}", gauge.label, format_percent(gauge.percent)))
+        .unwrap_or_else(|| "—".into())
 }
 
 fn format_percent(percent: f32) -> String {
     format!("{:.0}%", percent.clamp(0.0, 999.0))
 }
 
-fn usage_metric_bar(metric: &UsageMetric) -> El {
-    let fraction = (metric.percent / 100.0).clamp(0.0, 1.0);
+fn gauge_bar(gauge: &Gauge) -> El {
+    let fraction = (gauge.percent / 100.0).clamp(0.0, 1.0);
     column([
         row([
-            text(ellipsize(&metric.label, 18)).caption().muted(),
+            text(ellipsize(&gauge.label, 18)).caption().muted(),
             spacer(),
-            text(format_percent(metric.percent)).caption().muted(),
+            text(format_percent(gauge.percent)).caption().muted(),
         ])
         .align(Align::Center),
-        progress_with_color(fraction, metric_color(metric.percent))
+        progress_with_color(fraction, metric_color(gauge.percent))
             .height(Size::Fixed(7.0))
             .width(Size::Fill(1.0)),
     ])
@@ -365,10 +379,10 @@ fn module_fraction(module: &ModuleSnapshot) -> Option<f32> {
             current,
             total: Some(total),
         } if *total > 0 => Some((*current as f32 / *total as f32).clamp(0.0, 1.0)),
-        ModuleValue::Usage(usage) => usage
-            .metrics
+        ModuleValue::Gauges(group) => group
+            .gauges
             .first()
-            .map(|metric| (metric.percent / 100.0).clamp(0.0, 1.0)),
+            .map(|gauge| (gauge.percent / 100.0).clamp(0.0, 1.0)),
         _ => None,
     }
 }
@@ -395,19 +409,6 @@ fn ellipsize(value: &str, max_chars: usize) -> String {
         .rev()
         .collect::<String>();
     format!("{start}...{end}")
-}
-
-fn status_badge(status: ModuleStatus) -> El {
-    status_badge_with_label(
-        status,
-        match status {
-            ModuleStatus::Ok => "ok",
-            ModuleStatus::Info => "info",
-            ModuleStatus::Warning => "warn",
-            ModuleStatus::Critical => "crit",
-            ModuleStatus::Unknown => "idle",
-        },
-    )
 }
 
 fn status_badge_with_label(status: ModuleStatus, label: impl Into<String>) -> El {
@@ -475,12 +476,12 @@ fn module_brand_icon_kind(module: &ModuleSnapshot) -> Option<BrandIconKind> {
 mod tests {
     use super::*;
 
-    fn usage_module(metrics: Vec<UsageMetric>, detail: Option<&str>) -> ModuleSnapshot {
+    fn usage_module(gauges: Vec<Gauge>, detail: Option<&str>) -> ModuleSnapshot {
         ModuleSnapshot {
             id: "usage".into(),
             title: "codex".into(),
-            value: ModuleValue::Usage(UsageValue {
-                metrics,
+            value: ModuleValue::Gauges(GaugeGroup {
+                gauges,
                 detail: detail.map(ToOwned::to_owned),
             }),
             status: ModuleStatus::Ok,
@@ -489,8 +490,8 @@ mod tests {
         }
     }
 
-    fn metric(label: &str, percent: f32) -> UsageMetric {
-        UsageMetric {
+    fn metric(label: &str, percent: f32) -> Gauge {
+        Gauge {
             label: label.into(),
             percent,
         }
@@ -498,17 +499,17 @@ mod tests {
 
     #[test]
     fn headline_is_the_first_gauge() {
-        let usage = UsageValue {
-            metrics: vec![metric("5h", 18.0), metric("7d", 7.0)],
+        let group = GaugeGroup {
+            gauges: vec![metric("5h", 18.0), metric("7d", 7.0)],
             detail: Some("pro · resets Thu 10:41".into()),
         };
-        assert_eq!(usage_headline(&usage), "5h 18%");
+        assert_eq!(gauge_headline(&group), "5h 18%");
         assert_eq!(
-            usage_headline(&UsageValue {
-                metrics: vec![],
+            gauge_headline(&GaugeGroup {
+                gauges: vec![],
                 detail: None,
             }),
-            "usage"
+            "—"
         );
     }
 
@@ -571,5 +572,72 @@ mod tests {
             updated_at: None,
             stale_after: None,
         }
+    }
+
+    fn github_module(title: &str, detail: &str) -> ModuleSnapshot {
+        ModuleSnapshot {
+            id: title.into(),
+            title: title.into(),
+            value: ModuleValue::State {
+                label: "success".into(),
+                detail: Some(detail.into()),
+            },
+            status: ModuleStatus::Ok,
+            updated_at: None,
+            stale_after: None,
+        }
+    }
+
+    fn find_badge(node: &damascene_core::tree::El) -> Option<&damascene_core::tree::El> {
+        if node.kind == damascene_core::tree::Kind::Badge {
+            return Some(node);
+        }
+        node.children.iter().find_map(find_badge)
+    }
+
+    fn badge_rect(title: &str, detail: &str) -> damascene_core::tree::Rect {
+        use damascene_core::tree::Rect;
+        let snap = github_module(title, detail);
+        // Mirror sidebar_panel_card + apply_panel_width at the user's 400px.
+        let mut root = card([card_content([item_group([sidebar_module_item(&snap)])])
+            .padding(Sides::xy(tokens::SPACE_2, tokens::SPACE_2))])
+        .width(Size::Fixed(400.0));
+        let mut state = damascene_core::state::UiState::new();
+        damascene_core::layout::layout(&mut root, &mut state, Rect::new(0.0, 0.0, 400.0, 600.0));
+        let badge = find_badge(&root).expect("badge node present");
+        state.rect(&badge.computed_id)
+    }
+
+    // State entries (e.g. github CI) must right-justify their status badge: the
+    // trailing edge has to land in the same place regardless of how long the
+    // title is, and never overflow the panel. Regression guard for the bug where
+    // an overpacked header row collapsed the layout and staggered the badge by
+    // title length. Asserts the invariant, not exact pixels, to stay robust to
+    // font/token changes.
+    #[test]
+    fn state_badge_is_right_justified_independent_of_title() {
+        let panel_width = 400.0;
+        let short = badge_rect("a/b", "ci @ main");
+        let long = badge_rect("computer-whisperer/damascene", "ci @ main");
+        let longest = badge_rect("KalogonTech/Raven-Firmware", "build @ main");
+
+        let right = |r: damascene_core::tree::Rect| r.x + r.w;
+        assert!(
+            (right(short) - right(long)).abs() < 0.5,
+            "badge right edge shifts with title: {} vs {}",
+            right(short),
+            right(long)
+        );
+        assert!(
+            (right(short) - right(longest)).abs() < 0.5,
+            "badge right edge shifts with title: {} vs {}",
+            right(short),
+            right(longest)
+        );
+        assert!(
+            right(long) <= panel_width,
+            "badge overflows the panel: right edge {} > {panel_width}",
+            right(long)
+        );
     }
 }

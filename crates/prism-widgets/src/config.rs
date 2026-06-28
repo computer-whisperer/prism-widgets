@@ -3,8 +3,9 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use prism_widgets_core::{
-    ClockSpec, CommandSpec, GitHubSpec, ModuleSpec, PanelAnchor, PanelAppearance, PanelGeometry,
-    PanelId, PanelLayer, PanelLayout, PanelSpec, ThemeName, UsageSpec,
+    ClockSpec, CommandSpec, CpuSpec, GitHubSpec, GpuSpec, MemorySpec, ModuleSpec, PanelAnchor,
+    PanelAppearance, PanelGeometry, PanelId, PanelLayer, PanelLayout, PanelSpec, ThemeName,
+    UsageSpec,
 };
 
 #[derive(Debug, knuffel::Decode)]
@@ -69,6 +70,9 @@ enum ModuleNode {
     Command(CommandNode),
     Github(GitHubNode),
     Usage(UsageNode),
+    Cpu(CpuNode),
+    Memory(MemoryNode),
+    Gpu(GpuNode),
 }
 
 #[derive(Debug, knuffel::Decode)]
@@ -124,6 +128,32 @@ struct UsageNode {
     #[knuffel(property(name = "api-key-env"))]
     api_key_env: Option<String>,
     #[knuffel(property, default = 300)]
+    interval: u64,
+}
+
+#[derive(Debug, knuffel::Decode)]
+struct CpuNode {
+    #[knuffel(property, default = String::from("cpu"))]
+    id: String,
+    #[knuffel(property, default = 3)]
+    interval: u64,
+}
+
+#[derive(Debug, knuffel::Decode)]
+struct MemoryNode {
+    #[knuffel(property, default = String::from("memory"))]
+    id: String,
+    #[knuffel(property, default = 5)]
+    interval: u64,
+}
+
+#[derive(Debug, knuffel::Decode)]
+struct GpuNode {
+    #[knuffel(property, default = 0)]
+    card: u32,
+    #[knuffel(property)]
+    id: Option<String>,
+    #[knuffel(property, default = 3)]
     interval: u64,
 }
 
@@ -304,6 +334,15 @@ impl Config {
                     ModuleNode::Usage(usage) if usage.interval == 0 => {
                         anyhow::bail!("usage {:?}: interval must be at least 1", usage.source);
                     }
+                    ModuleNode::Cpu(cpu) if cpu.interval == 0 => {
+                        anyhow::bail!("cpu {:?}: interval must be at least 1", cpu.id);
+                    }
+                    ModuleNode::Memory(memory) if memory.interval == 0 => {
+                        anyhow::bail!("memory {:?}: interval must be at least 1", memory.id);
+                    }
+                    ModuleNode::Gpu(gpu) if gpu.interval == 0 => {
+                        anyhow::bail!("gpu card={}: interval must be at least 1", gpu.card);
+                    }
                     _ => {}
                 }
             }
@@ -436,6 +475,19 @@ impl ModuleNode {
                 base_url: usage.base_url.clone(),
                 api_key_env: usage.api_key_env.clone(),
                 interval: Duration::from_secs(usage.interval),
+            }),
+            ModuleNode::Cpu(cpu) => ModuleSpec::Cpu(CpuSpec {
+                id: cpu.id.clone(),
+                interval: Duration::from_secs(cpu.interval),
+            }),
+            ModuleNode::Memory(memory) => ModuleSpec::Memory(MemorySpec {
+                id: memory.id.clone(),
+                interval: Duration::from_secs(memory.interval),
+            }),
+            ModuleNode::Gpu(gpu) => ModuleSpec::Gpu(GpuSpec {
+                id: gpu.id.clone().unwrap_or_else(|| format!("gpu{}", gpu.card)),
+                card: gpu.card,
+                interval: Duration::from_secs(gpu.interval),
             }),
         }
     }

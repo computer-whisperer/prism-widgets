@@ -14,9 +14,9 @@ use std::time::{Duration, Instant, SystemTime};
 
 use base64::Engine;
 use prism_widgets_core::{
-    clock_snapshot, CommandSpec, GitHubSpec, ModuleSnapshot, ModuleSpec, ModuleStatus,
-    ModuleUpdate, ModuleValue, PanelId, PanelSnapshot, PanelSpec, UsageMetric, UsageSpec,
-    UsageValue,
+    clock_snapshot, CommandSpec, CpuSpec, Gauge, GaugeGroup, GitHubSpec, GpuSpec, MemorySpec,
+    ModuleSnapshot, ModuleSpec, ModuleStatus, ModuleUpdate, ModuleValue, PanelId, PanelSnapshot,
+    PanelSpec, UsageSpec,
 };
 use prism_widgets_host::{PanelDataSource, ProviderHandle, SnapshotSender};
 use serde_json::Value;
@@ -185,6 +185,9 @@ fn fetch_module(spec: &ModuleSpec) -> ModuleSnapshot {
         ModuleSpec::Command(spec) => command_snapshot(spec),
         ModuleSpec::GitHub(spec) => github_snapshot(spec),
         ModuleSpec::Usage(spec) => usage_snapshot(spec),
+        ModuleSpec::Cpu(spec) => cpu_snapshot(spec),
+        ModuleSpec::Memory(spec) => memory_snapshot(spec),
+        ModuleSpec::Gpu(spec) => gpu_snapshot(spec),
     }
 }
 
@@ -205,6 +208,9 @@ impl SnapshotStore {
             ModuleSpec::Command(spec) => command_snapshot(spec),
             ModuleSpec::GitHub(spec) => github_snapshot(spec),
             ModuleSpec::Usage(spec) => usage_snapshot(spec),
+            ModuleSpec::Cpu(spec) => cpu_snapshot(spec),
+            ModuleSpec::Memory(spec) => memory_snapshot(spec),
+            ModuleSpec::Gpu(spec) => gpu_snapshot(spec),
         };
 
         self.cache.lock().expect("snapshot cache").insert(
@@ -276,6 +282,299 @@ fn usage_snapshot(spec: &UsageSpec) -> ModuleSnapshot {
         }
         Err(err) => usage_error_snapshot(spec, &command, err),
     }
+}
+
+// ---- Local system metrics (CPU / memory / GPU) ----
+//
+// All read directly from `/proc` and `/sys` with no subprocess or crate
+// dependency. They run on the same worker threads as every other polled
+// module; CPU utilization needs a delta, which `read_cpu_util` takes by
+// sampling `/proc/stat` twice around a short sleep entirely within the worker.
+
+/// Build a gauge snapshot for a local system metric. `headline_percent` drives
+/// the status colour through the same thresholds as quota usage, so a saturated
+/// CPU/RAM/GPU meter reads warning/critical without a quota of its own.
+fn system_snapshot(
+    id: &str,
+    title: &str,
+    gauges: Vec<Gauge>,
+    detail: Option<String>,
+    headline_percent: f64,
+    interval: Duration,
+) -> ModuleSnapshot {
+    ModuleSnapshot {
+        id: id.to_string(),
+        title: title.to_string(),
+        value: ModuleValue::Gauges(GaugeGroup { gauges, detail }),
+        status: usage_status(headline_percent),
+        updated_at: Some(SystemTime::now()),
+        stale_after: Some(interval),
+    }
+}
+
+fn system_error(id: &str, title: &str, err: String, interval: Duration) -> ModuleSnapshot {
+    ModuleSnapshot {
+        id: id.to_string(),
+        title: title.to_string(),
+        value: ModuleValue::State {
+            label: "unavailable".into(),
+            detail: Some(first_line(&err)),
+        },
+        status: ModuleStatus::Warning,
+        updated_at: Some(SystemTime::now()),
+        stale_after: Some(interval),
+    }
+}
+
+fn cpu_snapshot(spec: &CpuSpec) -> ModuleSnapshot {
+    let util = match read_cpu_util() {
+        Ok(util) => util,
+        Err(err) => return system_error(&spec.id, "cpu", err, spec.interval),
+    };
+    let cores = thread::available_parallelism()
+        .map(|n| n.get() as f64)
+        .unwrap_or(1.0);
+    let load1 = read_loadavg().unwrap_or(0.0);
+    // Load relative to core count: 100% means every core has one runnable task
+    // on average; above that the machine is oversubscribed (common mid-build).
+    let load_pct = load1 / cores * 100.0;
+
+    let gauges = vec![gauge("util", util), gauge("load", load_pct)];
+    let mut details = Vec::new();
+    if let Some(temp) = cpu_temp_celsius() {
+        details.push(format!("{temp:.0}°C"));
+    }
+    details.push(format!("load {load1:.2}"));
+    let detail = Some(details.join(" · "));
+
+    system_snapshot(
+        &spec.id,
+        "cpu",
+        gauges,
+        detail,
+        util.max(load_pct),
+        spec.interval,
+    )
+}
+
+fn memory_snapshot(spec: &MemorySpec) -> ModuleSnapshot {
+    let mem = match read_meminfo() {
+        Ok(mem) => mem,
+        Err(err) => return system_error(&spec.id, "memory", err, spec.interval),
+    };
+    let used_kb = mem.total_kb.saturating_sub(mem.available_kb);
+    let ram_pct = percent_of(used_kb, mem.total_kb);
+    let swap_used_kb = mem.swap_total_kb.saturating_sub(mem.swap_free_kb);
+    let swap_pct = percent_of(swap_used_kb, mem.swap_total_kb);
+
+    let gauges = vec![gauge("ram", ram_pct), gauge("swap", swap_pct)];
+    let detail = Some(format!(
+        "{:.0} / {:.0} GiB",
+        kb_to_gib(used_kb),
+        kb_to_gib(mem.total_kb)
+    ));
+
+    system_snapshot(
+        &spec.id,
+        "memory",
+        gauges,
+        detail,
+        ram_pct.max(swap_pct),
+        spec.interval,
+    )
+}
+
+fn gpu_snapshot(spec: &GpuSpec) -> ModuleSnapshot {
+    let title = format!("gpu{}", spec.card);
+    let base = PathBuf::from(format!("/sys/class/drm/card{}/device", spec.card));
+
+    let busy = match read_u64(base.join("gpu_busy_percent")) {
+        Some(busy) => busy as f64,
+        None => {
+            return system_error(
+                &spec.id,
+                &title,
+                format!("no amdgpu card{}", spec.card),
+                spec.interval,
+            )
+        }
+    };
+
+    let mut gauges = vec![gauge("busy", busy)];
+    if let (Some(used), Some(total)) = (
+        read_u64(base.join("mem_info_vram_used")),
+        read_u64(base.join("mem_info_vram_total")),
+    ) {
+        gauges.push(gauge("vram", percent_of(used, total)));
+    }
+
+    let hwmon = amdgpu_hwmon(&base);
+    // Power draw is only a gauge when the card reports both draw and its cap;
+    // integrated parts expose neither, so the meter simply doesn't appear.
+    let watts = hwmon
+        .as_ref()
+        .and_then(|hwmon| read_u64(hwmon.join("power1_average")));
+    if let (Some(avg), Some(cap)) = (
+        watts,
+        hwmon
+            .as_ref()
+            .and_then(|hwmon| read_u64(hwmon.join("power1_cap"))),
+    ) {
+        gauges.push(gauge("power", percent_of(avg, cap)));
+    }
+
+    let mut details = Vec::new();
+    if let Some(milli) = hwmon
+        .as_ref()
+        .and_then(|hwmon| read_f64(hwmon.join("temp1_input")))
+    {
+        details.push(format!("{:.0}°C", milli / 1000.0));
+    }
+    if let Some(avg) = watts {
+        details.push(format!("{}W", avg / 1_000_000));
+    }
+    let detail = (!details.is_empty()).then(|| details.join(" · "));
+
+    system_snapshot(&spec.id, &title, gauges, detail, busy, spec.interval)
+}
+
+/// CPU utilization over a short window, sampling `/proc/stat` twice. Returns a
+/// 0–100 percentage of non-idle jiffies across the delta.
+fn read_cpu_util() -> Result<f64, String> {
+    let (busy1, total1) = read_proc_stat_totals()?;
+    thread::sleep(Duration::from_millis(200));
+    let (busy2, total2) = read_proc_stat_totals()?;
+    let total = total2.saturating_sub(total1);
+    if total == 0 {
+        return Ok(0.0);
+    }
+    let busy = busy2.saturating_sub(busy1);
+    Ok((busy as f64 / total as f64 * 100.0).clamp(0.0, 100.0))
+}
+
+fn read_proc_stat_totals() -> Result<(u64, u64), String> {
+    let text = std::fs::read_to_string("/proc/stat").map_err(|err| err.to_string())?;
+    parse_proc_stat_totals(&text)
+}
+
+/// `(busy_jiffies, total_jiffies)` from the aggregate `cpu` line of
+/// `/proc/stat`. Fields: user nice system idle iowait irq softirq steal …;
+/// idle is `idle + iowait`.
+fn parse_proc_stat_totals(text: &str) -> Result<(u64, u64), String> {
+    let line = text
+        .lines()
+        .next()
+        .filter(|line| line.starts_with("cpu "))
+        .ok_or("missing cpu line in /proc/stat")?;
+    let fields: Vec<u64> = line
+        .split_whitespace()
+        .skip(1)
+        .filter_map(|field| field.parse().ok())
+        .collect();
+    if fields.len() < 4 {
+        return Err("malformed cpu line in /proc/stat".into());
+    }
+    let total: u64 = fields.iter().sum();
+    let idle = fields[3] + fields.get(4).copied().unwrap_or(0);
+    Ok((total.saturating_sub(idle), total))
+}
+
+fn read_loadavg() -> Result<f64, String> {
+    let text = std::fs::read_to_string("/proc/loadavg").map_err(|err| err.to_string())?;
+    text.split_whitespace()
+        .next()
+        .and_then(|field| field.parse().ok())
+        .ok_or_else(|| "malformed /proc/loadavg".into())
+}
+
+struct MemInfo {
+    total_kb: u64,
+    available_kb: u64,
+    swap_total_kb: u64,
+    swap_free_kb: u64,
+}
+
+fn read_meminfo() -> Result<MemInfo, String> {
+    let text = std::fs::read_to_string("/proc/meminfo").map_err(|err| err.to_string())?;
+    parse_meminfo(&text)
+}
+
+fn parse_meminfo(text: &str) -> Result<MemInfo, String> {
+    let mut total = None;
+    let mut available = None;
+    let mut swap_total = None;
+    let mut swap_free = None;
+    for line in text.lines() {
+        let Some((key, rest)) = line.split_once(':') else {
+            continue;
+        };
+        let value = rest.split_whitespace().next().and_then(|v| v.parse().ok());
+        match key {
+            "MemTotal" => total = value,
+            "MemAvailable" => available = value,
+            "SwapTotal" => swap_total = value,
+            "SwapFree" => swap_free = value,
+            _ => {}
+        }
+    }
+    Ok(MemInfo {
+        total_kb: total.ok_or("missing MemTotal")?,
+        available_kb: available.ok_or("missing MemAvailable")?,
+        swap_total_kb: swap_total.unwrap_or(0),
+        swap_free_kb: swap_free.unwrap_or(0),
+    })
+}
+
+/// The `amdgpu` hwmon directory for a DRM card, where temperature and power
+/// live (e.g. `…/device/hwmon/hwmon3`).
+fn amdgpu_hwmon(base: &Path) -> Option<PathBuf> {
+    let dir = std::fs::read_dir(base.join("hwmon")).ok()?;
+    for entry in dir.flatten() {
+        let path = entry.path();
+        if read_trimmed(path.join("name")).as_deref() == Some("amdgpu") {
+            return Some(path);
+        }
+    }
+    None
+}
+
+fn cpu_temp_celsius() -> Option<f64> {
+    for entry in std::fs::read_dir("/sys/class/hwmon").ok()?.flatten() {
+        let path = entry.path();
+        // k10temp's temp1 is Tctl (AMD); coretemp's is the package (Intel).
+        if let Some("k10temp" | "coretemp") = read_trimmed(path.join("name")).as_deref() {
+            if let Some(milli) = read_f64(path.join("temp1_input")) {
+                return Some(milli / 1000.0);
+            }
+        }
+    }
+    None
+}
+
+fn percent_of(part: u64, whole: u64) -> f64 {
+    if whole == 0 {
+        0.0
+    } else {
+        part as f64 / whole as f64 * 100.0
+    }
+}
+
+fn kb_to_gib(kb: u64) -> f64 {
+    kb as f64 / (1024.0 * 1024.0)
+}
+
+fn read_trimmed(path: impl AsRef<Path>) -> Option<String> {
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|text| text.trim().to_string())
+}
+
+fn read_u64(path: impl AsRef<Path>) -> Option<u64> {
+    read_trimmed(path).and_then(|text| text.parse().ok())
+}
+
+fn read_f64(path: impl AsRef<Path>) -> Option<f64> {
+    read_trimmed(path).and_then(|text| text.parse().ok())
 }
 
 fn codex_usage_snapshot(spec: &UsageSpec) -> ModuleSnapshot {
@@ -535,12 +834,12 @@ impl ClaudeUsage {
         .flatten()
         .fold(0.0, f64::max);
 
-        let mut metrics = Vec::new();
+        let mut gauges = Vec::new();
         if let Some(window) = &self.five_hour {
-            metrics.push(usage_metric("5h", window.utilization));
+            gauges.push(gauge("5h", window.utilization));
         }
         if let Some(window) = &self.seven_day {
-            metrics.push(usage_metric("7d", window.utilization));
+            gauges.push(gauge("7d", window.utilization));
         }
 
         let mut details = Vec::new();
@@ -560,7 +859,7 @@ impl ClaudeUsage {
         ModuleSnapshot {
             id: spec.id.clone(),
             title: usage_title(spec),
-            value: ModuleValue::Usage(UsageValue { metrics, detail }),
+            value: ModuleValue::Gauges(GaugeGroup { gauges, detail }),
             status: usage_status(highest),
             updated_at: Some(SystemTime::now()),
             stale_after: Some(spec.interval),
@@ -586,12 +885,12 @@ impl CodexUsage {
         .flatten()
         .fold(0.0, f64::max);
 
-        let mut metrics = Vec::new();
+        let mut gauges = Vec::new();
         if let Some(window) = &self.primary {
-            metrics.push(usage_metric(window_label(window), window.used_percent));
+            gauges.push(gauge(window_label(window), window.used_percent));
         }
         if let Some(window) = &self.secondary {
-            metrics.push(usage_metric(window_label(window), window.used_percent));
+            gauges.push(gauge(window_label(window), window.used_percent));
         }
 
         let mut details = Vec::new();
@@ -614,7 +913,7 @@ impl CodexUsage {
         ModuleSnapshot {
             id: spec.id.clone(),
             title: usage_title(spec),
-            value: ModuleValue::Usage(UsageValue { metrics, detail }),
+            value: ModuleValue::Gauges(GaugeGroup { gauges, detail }),
             status: usage_status(highest),
             updated_at: Some(SystemTime::now()),
             stale_after: Some(spec.interval),
@@ -1238,8 +1537,8 @@ fn usage_status(percent: f64) -> ModuleStatus {
     }
 }
 
-fn usage_metric(label: &str, percent: f64) -> UsageMetric {
-    UsageMetric {
+fn gauge(label: &str, percent: f64) -> Gauge {
+    Gauge {
         label: label.to_string(),
         percent: percent as f32,
     }
@@ -1412,6 +1711,48 @@ mod tests {
             .encode(serde_json::to_string(&payload).unwrap());
         let signature = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"sig");
         format!("{header}.{payload}.{signature}")
+    }
+
+    #[test]
+    fn proc_stat_totals_split_idle_from_busy() {
+        // user nice system idle iowait irq softirq steal
+        let (busy, total) = parse_proc_stat_totals("cpu  100 0 50 800 40 5 5 0\ncpu0 ...").unwrap();
+        // idle = idle(800) + iowait(40) = 840; total = 1000; busy = 160.
+        assert_eq!(total, 1000);
+        assert_eq!(busy, 160);
+    }
+
+    #[test]
+    fn proc_stat_totals_rejects_missing_cpu_line() {
+        assert!(parse_proc_stat_totals("intr 1 2 3").is_err());
+        assert!(parse_proc_stat_totals("cpu 1 2").is_err());
+    }
+
+    #[test]
+    fn meminfo_reads_ram_and_swap_with_optional_swap() {
+        let mem = parse_meminfo(
+            "MemTotal:       131795128 kB\n\
+             MemFree:          1000000 kB\n\
+             MemAvailable:   115207540 kB\n\
+             SwapTotal:      134217724 kB\n\
+             SwapFree:       134102888 kB\n",
+        )
+        .unwrap();
+        assert_eq!(mem.total_kb, 131_795_128);
+        assert_eq!(mem.available_kb, 115_207_540);
+        assert_eq!(mem.swap_total_kb, 134_217_724);
+        assert_eq!(mem.swap_free_kb, 134_102_888);
+
+        // Swap is optional (swapless hosts); RAM fields are required.
+        let no_swap = parse_meminfo("MemTotal: 100 kB\nMemAvailable: 40 kB\n").unwrap();
+        assert_eq!(no_swap.swap_total_kb, 0);
+        assert!(parse_meminfo("MemFree: 10 kB\n").is_err());
+    }
+
+    #[test]
+    fn percent_of_guards_zero_whole() {
+        assert_eq!(percent_of(0, 0), 0.0);
+        assert_eq!(percent_of(1, 4), 25.0);
     }
 
     #[test]
