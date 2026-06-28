@@ -634,7 +634,12 @@ fn github_snapshot(spec: &GitHubSpec) -> ModuleSnapshot {
 
     match run_command("gh", &["api", &endpoint], &envs) {
         Ok(text) => parse_github_runs(spec, &text).unwrap_or_else(|| {
-            error_snapshot(&spec.id, github_title(spec), "no workflow runs", spec.interval)
+            error_snapshot(
+                &spec.id,
+                github_title(spec),
+                "no workflow runs",
+                spec.interval,
+            )
         }),
         Err(err) => error_snapshot(&spec.id, github_title(spec), err, spec.interval),
     }
@@ -1744,7 +1749,10 @@ mod tests {
             interval: Duration::from_secs(60),
             token_env: None,
         };
-        assert_eq!(github_title(&spec), "computer-whisperer/some-very-long-repo-name");
+        assert_eq!(
+            github_title(&spec),
+            "computer-whisperer/some-very-long-repo-name"
+        );
         spec.title = Some("shortname".into());
         assert_eq!(github_title(&spec), "shortname");
     }
