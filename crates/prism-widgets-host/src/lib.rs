@@ -306,7 +306,7 @@ pub fn run_layer_shell_with_reload(
             }
         }
         for i in 0..host.surfaces.len() {
-            host.refresh_and_draw(i);
+            host.refresh_and_draw(i, &qh);
         }
     }
 
@@ -345,6 +345,13 @@ struct PanelSurface {
     scale: i32,
     dirty: bool,
     anim_deadline: Option<Instant>,
+    // True once we have committed a frame and requested a `wl_surface.frame`
+    // callback that has not yet fired. While set, we hold off drawing and
+    // committing again — timer/provider triggers only accumulate `dirty`, and
+    // the next actual draw waits for the callback. The compositor withholds
+    // callbacks for powered-off outputs, so this stalls rendering for free
+    // while screens are off instead of spinning at buffer-release rate.
+    awaiting_frame: bool,
     // Last snapshots painted to this surface, for redraw suppression.
     last_snapshots: Vec<PanelSnapshot>,
 }
@@ -452,6 +459,7 @@ impl LayerHost {
             scale: 1,
             dirty: false,
             anim_deadline: None,
+            awaiting_frame: false,
             last_snapshots: Vec::new(),
         });
     }
@@ -474,7 +482,14 @@ impl LayerHost {
 
     /// Assemble this surface's snapshots, and redraw only when the result
     /// differs from what is currently painted (or a redraw is forced).
-    fn refresh_and_draw(&mut self, i: usize) {
+    fn refresh_and_draw(&mut self, i: usize, qh: &QueueHandle<Self>) {
+        // Hold off while a requested frame callback is still outstanding: the
+        // compositor paces us (and withholds callbacks entirely for
+        // powered-off outputs). Timer/provider triggers keep marking `dirty`;
+        // the accumulated work is flushed when the callback fires.
+        if self.surfaces[i].awaiting_frame {
+            return;
+        }
         let snapshots: Vec<PanelSnapshot> = self.surfaces[i]
             .panels
             .iter()
@@ -483,11 +498,11 @@ impl LayerHost {
         let changed = !snapshots_display_eq(&snapshots, &self.surfaces[i].last_snapshots);
         if self.surfaces[i].dirty || changed {
             self.surfaces[i].last_snapshots = snapshots.clone();
-            self.draw(i, snapshots);
+            self.draw(i, snapshots, qh);
         }
     }
 
-    fn draw(&mut self, i: usize, snapshots: Vec<PanelSnapshot>) {
+    fn draw(&mut self, i: usize, snapshots: Vec<PanelSnapshot>, qh: &QueueHandle<Self>) {
         let gpu = self.gpu.as_ref().expect("gpu exists once surfaces do");
         let surface = &mut self.surfaces[i];
         surface.dirty = false;
@@ -495,11 +510,16 @@ impl LayerHost {
             return;
         };
 
+        // Cloned so the `&mut surface.app` borrow below can coexist; the proxy
+        // is a cheap handle to the same server-side surface wgpu commits.
+        let wl_surface = surface.layer.wl_surface().clone();
         surface
             .app
             .set_views(panel_views_from_snapshots(&surface.panels, &snapshots));
         let outcome = render_frame(
             gpu,
+            &wl_surface,
+            qh,
             &surface.wgpu_surface,
             sc,
             &mut surface.app,
@@ -509,6 +529,9 @@ impl LayerHost {
         );
         surface.dirty = outcome.retry;
         surface.anim_deadline = outcome.anim_deadline;
+        // Only wait on a callback if we actually committed a buffer; the
+        // retry/error paths commit nothing, so no callback would ever arrive.
+        surface.awaiting_frame = outcome.committed;
     }
 
     fn surface_index_for(&self, surface: &wl_surface::WlSurface) -> Option<usize> {
@@ -649,6 +672,9 @@ impl LayerShellHandler for LayerHost {
         }
         self.configure_swapchain(i);
         self.surfaces[i].dirty = true;
+        // A configure asks us to commit a fresh buffer; don't let a stale gate
+        // stall the response.
+        self.surfaces[i].awaiting_frame = false;
     }
 }
 
@@ -670,6 +696,7 @@ impl CompositorHandler for LayerHost {
                 self.configure_swapchain(i);
             }
             self.surfaces[i].dirty = true;
+            self.surfaces[i].awaiting_frame = false;
         }
     }
 
@@ -686,9 +713,15 @@ impl CompositorHandler for LayerHost {
         &mut self,
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
-        _surface: &wl_surface::WlSurface,
+        surface: &wl_surface::WlSurface,
         _time: u32,
     ) {
+        // The compositor is ready for another frame on this surface. Release
+        // the gate; any accumulated `dirty`/`anim_deadline` is drawn on the
+        // next loop iteration.
+        if let Some(i) = self.surface_index_for(surface) {
+            self.surfaces[i].awaiting_frame = false;
+        }
     }
 
     fn surface_enter(
@@ -1122,10 +1155,15 @@ fn setup_swapchain(
 struct FrameOutcome {
     retry: bool,
     anim_deadline: Option<Instant>,
+    // Whether a buffer was actually attached and committed this call. When
+    // false (surface lost/unavailable), no frame callback was armed.
+    committed: bool,
 }
 
 fn render_frame<A: App>(
     gpu: &GpuShared,
+    wl_surface: &wl_surface::WlSurface,
+    qh: &QueueHandle<LayerHost>,
     wgpu_surface: &wgpu::Surface<'_>,
     sc: &mut Swapchain,
     app: &mut A,
@@ -1158,6 +1196,7 @@ fn render_frame<A: App>(
             return FrameOutcome {
                 retry: true,
                 anim_deadline: None,
+                committed: false,
             };
         }
         other => {
@@ -1165,6 +1204,7 @@ fn render_frame<A: App>(
             return FrameOutcome {
                 retry: false,
                 anim_deadline: None,
+                committed: false,
             };
         }
     };
@@ -1185,6 +1225,11 @@ fn render_frame<A: App>(
         wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
     );
     gpu.queue.submit(Some(encoder.finish()));
+    // Request a frame callback *before* presenting. The request is
+    // double-buffered surface state latched by the commit that wgpu issues
+    // inside `present()`, so it rides out on this same frame. SCTK routes the
+    // callback back to `CompositorHandler::frame` via the surface user-data.
+    wl_surface.frame(qh, wl_surface.clone());
     frame.present();
 
     let mut anim_deadline = prepare.next_redraw_in.map(|delay| Instant::now() + delay);
@@ -1194,6 +1239,7 @@ fn render_frame<A: App>(
     FrameOutcome {
         retry: false,
         anim_deadline,
+        committed: true,
     }
 }
 
