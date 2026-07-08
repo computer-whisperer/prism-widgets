@@ -518,9 +518,11 @@ impl LayerHost {
             .set_views(panel_views_from_snapshots(&surface.panels, &snapshots));
         let outcome = render_frame(
             gpu,
-            &wl_surface,
-            qh,
-            &surface.wgpu_surface,
+            PresentTarget {
+                wgpu: &surface.wgpu_surface,
+                wl_surface: &wl_surface,
+                qh,
+            },
             sc,
             &mut surface.app,
             (surface.width, surface.height),
@@ -1160,11 +1162,18 @@ struct FrameOutcome {
     committed: bool,
 }
 
+/// Where a frame is presented: the wgpu surface to render into, plus the
+/// Wayland surface and queue handle used to arm the next `wl_surface.frame`
+/// callback that paces (and gates, while outputs are off) the render loop.
+struct PresentTarget<'a> {
+    wgpu: &'a wgpu::Surface<'static>,
+    wl_surface: &'a wl_surface::WlSurface,
+    qh: &'a QueueHandle<LayerHost>,
+}
+
 fn render_frame<A: App>(
     gpu: &GpuShared,
-    wl_surface: &wl_surface::WlSurface,
-    qh: &QueueHandle<LayerHost>,
-    wgpu_surface: &wgpu::Surface<'_>,
+    target: PresentTarget<'_>,
     sc: &mut Swapchain,
     app: &mut A,
     (width, height): (u32, u32),
@@ -1188,11 +1197,11 @@ fn render_frame<A: App>(
         .runner
         .prepare(&gpu.device, &gpu.queue, &mut tree, viewport, scale as f32);
 
-    let frame = match wgpu_surface.get_current_texture() {
+    let frame = match target.wgpu.get_current_texture() {
         wgpu::CurrentSurfaceTexture::Success(texture)
         | wgpu::CurrentSurfaceTexture::Suboptimal(texture) => texture,
         wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
-            wgpu_surface.configure(&gpu.device, &sc.config);
+            target.wgpu.configure(&gpu.device, &sc.config);
             return FrameOutcome {
                 retry: true,
                 anim_deadline: None,
@@ -1229,7 +1238,9 @@ fn render_frame<A: App>(
     // double-buffered surface state latched by the commit that wgpu issues
     // inside `present()`, so it rides out on this same frame. SCTK routes the
     // callback back to `CompositorHandler::frame` via the surface user-data.
-    wl_surface.frame(qh, wl_surface.clone());
+    target
+        .wl_surface
+        .frame(target.qh, target.wl_surface.clone());
     frame.present();
 
     let mut anim_deadline = prepare.next_redraw_in.map(|delay| Instant::now() + delay);
