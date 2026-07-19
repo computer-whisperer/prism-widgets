@@ -28,12 +28,29 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(15);
 /// Shared HTTP agent with bounded timeouts. Without these a hung connection
 /// would keep a worker thread (and the snapshot it owes) alive indefinitely,
 /// including past a config reload that tried to retire it.
+///
+/// `http_status_as_error(false)` makes 4xx/5xx come back as `Ok(response)`
+/// rather than an opaque error, so each fetch can read status-specific headers
+/// and bodies itself (retry-after, error detail).
 static HTTP: LazyLock<ureq::Agent> = LazyLock::new(|| {
-    ureq::AgentBuilder::new()
-        .timeout_connect(HTTP_CONNECT_TIMEOUT)
-        .timeout(HTTP_TIMEOUT)
-        .build()
+    let config = ureq::Agent::config_builder()
+        .timeout_connect(Some(HTTP_CONNECT_TIMEOUT))
+        .timeout_global(Some(HTTP_TIMEOUT))
+        .http_status_as_error(false)
+        .build();
+    ureq::Agent::new_with_config(config)
 });
+
+/// ureq 3 response type: the `http` crate's `Response` carrying a ureq `Body`.
+type HttpResponse = ureq::http::Response<ureq::Body>;
+
+/// Read a response header as a string, or `None` when absent or non-ASCII.
+fn response_header<'a>(response: &'a HttpResponse, name: &str) -> Option<&'a str> {
+    response
+        .headers()
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+}
 const CLAUDE_USAGE_BASE_URL: &str = "https://api.anthropic.com";
 const CLAUDE_USAGE_BETA: &str = "oauth-2025-04-20";
 const CODEX_REFRESH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
@@ -821,10 +838,17 @@ fn fetch_statuspage(spec: &StatusPageSpec) -> Result<ModuleSnapshot, String> {
     let url = format!("{base}/api/v2/summary.json");
     let response = HTTP
         .get(&url)
-        .set("User-Agent", "prism-widgets")
+        .header("User-Agent", "prism-widgets")
         .call()
         .map_err(|err| first_line(&err.to_string()))?;
-    let text = response.into_string().map_err(|err| err.to_string())?;
+    let status = response.status().as_u16();
+    if !(200..300).contains(&status) {
+        return Err(format!("status page error ({status})"));
+    }
+    let text = response
+        .into_body()
+        .read_to_string()
+        .map_err(|err| err.to_string())?;
     let json: Value = serde_json::from_str(&text).map_err(|err| format!("invalid JSON: {err}"))?;
     parse_statuspage(spec, &json).ok_or_else(|| "unrecognized status response".to_string())
 }
@@ -1118,28 +1142,30 @@ fn fetch_codex_usage(spec: &UsageSpec) -> Result<CodexUsage, String> {
     let account_header_sent = auth.account_id().is_some();
     let mut request = HTTP
         .get(CODEX_WHAM_USAGE_URL)
-        .set("User-Agent", "prism-widgets")
-        .set("Authorization", &format!("Bearer {}", auth.access_token()));
+        .header("User-Agent", "prism-widgets")
+        .header("Authorization", format!("Bearer {}", auth.access_token()));
     if let Some(account_id) = auth.account_id() {
-        request = request.set("chatgpt-account-id", account_id);
+        request = request.header("chatgpt-account-id", account_id);
     }
 
-    let response = match request.call() {
-        Ok(response) => response,
-        Err(ureq::Error::Status(401, _)) => return Err("token expired; run codex login".into()),
-        Err(ureq::Error::Status(429, response)) => {
-            let detail = response
-                .header("retry-after")
+    let response = request.call().map_err(|err| err.to_string())?;
+    match response.status().as_u16() {
+        401 => return Err("token expired; run codex login".into()),
+        429 => {
+            let detail = response_header(&response, "retry-after")
                 .map(|seconds| format!("rate limited, retry after {seconds}s"))
                 .unwrap_or_else(|| "rate limited".into());
             return Err(detail);
         }
-        Err(ureq::Error::Status(status, _)) => return Err(format!("API error ({status})")),
-        Err(err) => return Err(err.to_string()),
-    };
+        status if !(200..300).contains(&status) => return Err(format!("API error ({status})")),
+        _ => {}
+    }
 
     let header_usage = parse_codex_usage_headers(&response);
-    let body = response.into_string().map_err(|err| err.to_string())?;
+    let body = response
+        .into_body()
+        .read_to_string()
+        .map_err(|err| err.to_string())?;
     if let Some(usage) =
         parse_codex_usage_response(&body).map_err(|err| format!("invalid usage response: {err}"))?
     {
@@ -1180,7 +1206,7 @@ fn parse_codex_usage_response(body: &str) -> Result<Option<CodexUsage>, serde_js
     Ok(None)
 }
 
-fn parse_codex_usage_headers(response: &ureq::Response) -> Option<CodexUsage> {
+fn parse_codex_usage_headers(response: &HttpResponse) -> Option<CodexUsage> {
     let primary = codex_header_window(response, "x-codex-primary");
     let secondary = codex_header_window(response, "x-codex-secondary");
     let credits = codex_header_credits(response);
@@ -1327,7 +1353,7 @@ fn summarize_json_entry(key: &str, value: &Value, depth: usize) -> String {
     }
 }
 
-fn codex_header_window(response: &ureq::Response, prefix: &str) -> Option<CodexUsageWindow> {
+fn codex_header_window(response: &HttpResponse, prefix: &str) -> Option<CodexUsageWindow> {
     Some(CodexUsageWindow {
         used_percent: codex_header_f64(response, &format!("{prefix}-used-percent"))?,
         window_minutes: codex_header_u64(response, &format!("{prefix}-window-minutes")),
@@ -1335,12 +1361,10 @@ fn codex_header_window(response: &ureq::Response, prefix: &str) -> Option<CodexU
     })
 }
 
-fn codex_header_credits(response: &ureq::Response) -> Option<CodexUsageCredits> {
+fn codex_header_credits(response: &HttpResponse) -> Option<CodexUsageCredits> {
     let has_credits = codex_header_bool(response, "x-codex-credits-has-credits");
     let unlimited = codex_header_bool(response, "x-codex-credits-unlimited");
-    let balance = response
-        .header("x-codex-credits-balance")
-        .map(ToOwned::to_owned);
+    let balance = response_header(response, "x-codex-credits-balance").map(ToOwned::to_owned);
     if has_credits.is_none() && unlimited.is_none() && balance.is_none() {
         return None;
     }
@@ -1351,20 +1375,20 @@ fn codex_header_credits(response: &ureq::Response) -> Option<CodexUsageCredits> 
     })
 }
 
-fn codex_header_f64(response: &ureq::Response, name: &str) -> Option<f64> {
-    response.header(name).and_then(|value| value.parse().ok())
+fn codex_header_f64(response: &HttpResponse, name: &str) -> Option<f64> {
+    response_header(response, name).and_then(|value| value.parse().ok())
 }
 
-fn codex_header_u64(response: &ureq::Response, name: &str) -> Option<u64> {
-    response.header(name).and_then(|value| value.parse().ok())
+fn codex_header_u64(response: &HttpResponse, name: &str) -> Option<u64> {
+    response_header(response, name).and_then(|value| value.parse().ok())
 }
 
-fn codex_header_i64(response: &ureq::Response, name: &str) -> Option<i64> {
-    response.header(name).and_then(|value| value.parse().ok())
+fn codex_header_i64(response: &HttpResponse, name: &str) -> Option<i64> {
+    response_header(response, name).and_then(|value| value.parse().ok())
 }
 
-fn codex_header_bool(response: &ureq::Response, name: &str) -> Option<bool> {
-    match response.header(name)? {
+fn codex_header_bool(response: &HttpResponse, name: &str) -> Option<bool> {
+    match response_header(response, name)? {
         "true" | "1" => Some(true),
         "false" | "0" => Some(false),
         _ => None,
@@ -1381,38 +1405,38 @@ fn fetch_claude_usage(spec: &UsageSpec) -> Result<ClaudeUsage, String> {
     let url = format!("{base_url}/api/oauth/usage");
     let mut request = HTTP
         .get(&url)
-        .set("Content-Type", "application/json")
-        .set("User-Agent", "prism-widgets")
-        .set("anthropic-beta", CLAUDE_USAGE_BETA);
+        .header("Content-Type", "application/json")
+        .header("User-Agent", "prism-widgets")
+        .header("anthropic-beta", CLAUDE_USAGE_BETA);
 
     match auth {
         ClaudeAuth::Oauth(token) => {
-            request = request.set("Authorization", &format!("Bearer {token}"));
+            request = request.header("Authorization", format!("Bearer {token}"));
         }
         ClaudeAuth::ApiKey(key) => {
-            request = request.set("x-api-key", &key);
+            request = request.header("x-api-key", key);
         }
     }
 
-    let response = match request.call() {
-        Ok(response) => response,
-        Err(ureq::Error::Status(401, _)) if spec.base_url.is_none() => {
-            return Err("token expired".into());
-        }
-        Err(ureq::Error::Status(401, _)) => return Err("invalid API key".into()),
-        Err(ureq::Error::Status(404, _)) => return Err("endpoint not found".into()),
-        Err(ureq::Error::Status(429, response)) => {
-            let detail = response
-                .header("retry-after")
+    let response = request.call().map_err(|err| err.to_string())?;
+    match response.status().as_u16() {
+        401 if spec.base_url.is_none() => return Err("token expired".into()),
+        401 => return Err("invalid API key".into()),
+        404 => return Err("endpoint not found".into()),
+        429 => {
+            let detail = response_header(&response, "retry-after")
                 .map(|seconds| format!("rate limited, retry after {seconds}s"))
                 .unwrap_or_else(|| "rate limited".into());
             return Err(detail);
         }
-        Err(ureq::Error::Status(status, _)) => return Err(format!("API error ({status})")),
-        Err(err) => return Err(err.to_string()),
-    };
+        status if !(200..300).contains(&status) => return Err(format!("API error ({status})")),
+        _ => {}
+    }
 
-    let text = response.into_string().map_err(|err| err.to_string())?;
+    let text = response
+        .into_body()
+        .read_to_string()
+        .map_err(|err| err.to_string())?;
     let json: Value = serde_json::from_str(&text).map_err(|err| format!("invalid JSON: {err}"))?;
     Ok(ClaudeUsage {
         plan,
@@ -1488,23 +1512,21 @@ impl CodexAuthState {
             "grant_type": "refresh_token",
             "refresh_token": refresh_token,
         });
-        let response = match HTTP
+        let response = HTTP
             .post(CODEX_REFRESH_TOKEN_URL)
-            .set("Content-Type", "application/json")
-            .send_string(&body.to_string())
-        {
-            Ok(response) => response,
-            Err(ureq::Error::Status(status, response)) => {
-                let body = response.into_string().unwrap_or_default();
-                return Err(format!(
-                    "codex refresh returned {status}: {body}; run codex login"
-                ));
-            }
-            Err(err) => return Err(format!("codex refresh: {err}")),
-        };
-        let text = response
-            .into_string()
+            .header("Content-Type", "application/json")
+            .send(body.to_string())
             .map_err(|err| format!("codex refresh: {err}"))?;
+        let status = response.status().as_u16();
+        let text = response
+            .into_body()
+            .read_to_string()
+            .map_err(|err| format!("codex refresh: {err}"))?;
+        if !(200..300).contains(&status) {
+            return Err(format!(
+                "codex refresh returned {status}: {text}; run codex login"
+            ));
+        }
         let fresh: Value =
             serde_json::from_str(&text).map_err(|err| format!("codex refresh JSON: {err}"))?;
         for key in ["id_token", "access_token", "refresh_token"] {
