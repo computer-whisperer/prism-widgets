@@ -190,9 +190,17 @@ fn apply_panel_width(mut panel: El, view: &PanelView) -> El {
     if !view.appearance.border {
         panel = panel.stroke_width(0.0);
     }
-    match view.width {
-        Some(width) => panel.width(Size::Fixed(width as f32)),
-        None => panel.fill_width(),
+    // Wire the configured corner radius (otherwise the card keeps damascene's
+    // RADIUS_LG default and the `radius` config property is a no-op).
+    panel = panel.radius(view.appearance.radius);
+    match (view.layout, view.width) {
+        // Sidebar cards fill the shell's padded column rather than taking the
+        // full surface width: a fixed width equal to the surface overflows the
+        // SPACE_2 padding, and the shell's rectangular clip then shears the
+        // outer rounded corners (the "left-rounded, right-sharp" bug).
+        (PanelLayout::Sidebar, _) => panel.fill_width(),
+        (_, Some(width)) => panel.width(Size::Fixed(width as f32)),
+        (_, None) => panel.fill_width(),
     }
 }
 
@@ -603,6 +611,63 @@ mod tests {
             updated_at: None,
             stale_after: None,
         }
+    }
+
+    fn panel_view(layout: PanelLayout, anchor: PanelAnchor, width: Option<u32>) -> PanelView {
+        PanelView::new(
+            PanelAppearance {
+                opacity: 1.0,
+                radius: 12.0,
+                border: true,
+                show_header: false,
+                theme: ThemeName::Dark,
+            },
+            anchor,
+            layout,
+            width,
+            PanelSnapshot {
+                panel_id: prism_widgets_core::PanelId::new("p"),
+                modules: vec![github_module("a/b", "ci @ main")],
+            },
+        )
+    }
+
+    // Regression: a sidebar card pinned to the full surface width overflowed the
+    // shell's SPACE_2 padding, and the shell's rectangular clip sheared the
+    // outer rounded corners (left-rounded, right-sharp, regardless of anchor).
+    // Sidebar cards must fill the padded column; bars keep their fixed width.
+    #[test]
+    fn sidebar_card_fills_shell_while_bar_keeps_fixed_width() {
+        let side = sidebar_panel_card(&panel_view(
+            PanelLayout::Sidebar,
+            PanelAnchor::Right,
+            Some(400),
+        ));
+        assert!(
+            matches!(side.width, Size::Fill(_)),
+            "sidebar card must fill its padded shell, got {:?}",
+            side.width
+        );
+        let side_left = sidebar_panel_card(&panel_view(
+            PanelLayout::Sidebar,
+            PanelAnchor::Left,
+            Some(400),
+        ));
+        assert!(
+            matches!(side_left.width, Size::Fill(_)),
+            "left-anchored sidebar must fill too, got {:?}",
+            side_left.width
+        );
+        let bar = bar_panel_card(&panel_view(
+            PanelLayout::Bar,
+            PanelAnchor::TopRight,
+            Some(400),
+        ));
+        assert!(
+            matches!(bar.width, Size::Fixed(w) if (w - 400.0).abs() < 0.5),
+            "bar card should keep its configured fixed width, got {:?}",
+            bar.width
+        );
     }
 
     fn find_badge(node: &damascene_core::tree::El) -> Option<&damascene_core::tree::El> {
