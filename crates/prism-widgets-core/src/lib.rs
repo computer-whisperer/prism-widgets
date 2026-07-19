@@ -87,6 +87,8 @@ pub enum ModuleSpec {
     Clock(ClockSpec),
     Command(CommandSpec),
     GitHub(GitHubSpec),
+    GitLab(GitLabSpec),
+    StatusPage(StatusPageSpec),
     Usage(UsageSpec),
     Cpu(CpuSpec),
     Memory(MemorySpec),
@@ -99,11 +101,22 @@ impl ModuleSpec {
             ModuleSpec::Clock(spec) => &spec.id,
             ModuleSpec::Command(spec) => &spec.id,
             ModuleSpec::GitHub(spec) => &spec.id,
+            ModuleSpec::GitLab(spec) => &spec.id,
+            ModuleSpec::StatusPage(spec) => &spec.id,
             ModuleSpec::Usage(spec) => &spec.id,
             ModuleSpec::Cpu(spec) => &spec.id,
             ModuleSpec::Memory(spec) => &spec.id,
             ModuleSpec::Gpu(spec) => &spec.id,
         }
+    }
+
+    /// Whether this module is omitted from the panel while its status is OK
+    /// (or before its first poll), surfacing only when something is wrong.
+    ///
+    /// Used by statuspage monitors, which are silent until an outage rather
+    /// than occupying a permanent slot showing "operational".
+    pub fn hides_when_ok(&self) -> bool {
+        matches!(self, ModuleSpec::StatusPage(_))
     }
 
     /// Background refresh interval for modules polled on worker threads.
@@ -115,6 +128,8 @@ impl ModuleSpec {
             ModuleSpec::Clock(_) => None,
             ModuleSpec::Command(spec) => Some(spec.interval),
             ModuleSpec::GitHub(spec) => Some(spec.interval),
+            ModuleSpec::GitLab(spec) => Some(spec.interval),
+            ModuleSpec::StatusPage(spec) => Some(spec.interval),
             ModuleSpec::Usage(spec) => Some(spec.interval),
             ModuleSpec::Cpu(spec) => Some(spec.interval),
             ModuleSpec::Memory(spec) => Some(spec.interval),
@@ -181,6 +196,39 @@ pub struct GitHubSpec {
     pub token_env: Option<String>,
 }
 
+/// A service-status monitor backed by an Atlassian Statuspage (the JSON at
+/// `<url>/api/v2/summary.json`, as served by status.claude.com and many others).
+/// Collapsible: the module stays hidden while all systems are operational and
+/// appears only on a reported incident. See [`ModuleSpec::hides_when_ok`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StatusPageSpec {
+    pub id: String,
+    /// Statuspage base URL, e.g. `https://status.claude.com`.
+    pub url: String,
+    /// Display title; falls back to `status` when unset.
+    pub title: Option<String>,
+    pub interval: Duration,
+}
+
+/// Latest CI pipeline for a GitLab project, fetched via the `glab` CLI. The
+/// GitLab analogue of [`GitHubSpec`]; GitLab has no per-workflow split, so the
+/// widget tracks the newest pipeline for the (optional) branch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GitLabSpec {
+    pub id: String,
+    /// Project path (`group/name`, possibly nested) or numeric project id.
+    pub project: String,
+    /// Display title; falls back to `project` when unset.
+    pub title: Option<String>,
+    pub branch: Option<String>,
+    /// Host for self-hosted instances (passed to `glab --hostname`); defaults
+    /// to gitlab.com when unset.
+    pub host: Option<String>,
+    pub interval: Duration,
+    /// Env var holding a GitLab token; exported to `glab` as `GITLAB_TOKEN`.
+    pub token_env: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UsageSpec {
     pub id: String,
@@ -191,6 +239,11 @@ pub struct UsageSpec {
     pub auth_path: Option<String>,
     pub base_url: Option<String>,
     pub api_key_env: Option<String>,
+    /// Which usage windows to draw as gauges, in order (claude source only).
+    /// Tokens: `5h`/`session`, `7d`/`weekly`, or a model name matched against
+    /// the API's per-model weekly limits (e.g. `fable`). `None` renders the
+    /// default `5h 7d`.
+    pub windows: Option<Vec<String>>,
     pub interval: Duration,
 }
 

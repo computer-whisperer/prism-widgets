@@ -14,11 +14,11 @@ use std::time::{Duration, Instant, SystemTime};
 
 use base64::Engine;
 use prism_widgets_core::{
-    clock_snapshot, CommandSpec, CpuSpec, Gauge, GaugeGroup, GitHubSpec, GpuSpec, MemorySpec,
-    ModuleSnapshot, ModuleSpec, ModuleStatus, ModuleUpdate, ModuleValue, PanelId, PanelSnapshot,
-    PanelSpec, UsageSpec,
+    clock_snapshot, CommandSpec, CpuSpec, Gauge, GaugeGroup, GitHubSpec, GitLabSpec, GpuSpec,
+    MemorySpec, ModuleSnapshot, ModuleSpec, ModuleStatus, ModuleUpdate, ModuleValue, PanelId,
+    PanelSnapshot, PanelSpec, StatusPageSpec, UsageSpec,
 };
-use prism_widgets_host::{PanelDataSource, ProviderHandle, SnapshotSender};
+use prism_widgets_host::{collapse_snapshot, PanelDataSource, ProviderHandle, SnapshotSender};
 use serde_json::Value;
 
 const COMMAND_TIMEOUT: &str = "10s";
@@ -75,7 +75,9 @@ impl PanelDataSource for SnapshotStore {
                 modules: panel
                     .modules
                     .iter()
-                    .map(|module| self.module_snapshot(panel, module))
+                    .filter_map(|module| {
+                        collapse_snapshot(module, Some(self.module_snapshot(panel, module)))
+                    })
                     .collect(),
             })
             .unwrap_or_else(|| PanelSnapshot::empty(panel_id.clone()))
@@ -184,6 +186,8 @@ fn fetch_module(spec: &ModuleSpec) -> ModuleSnapshot {
         ModuleSpec::Clock(spec) => clock_snapshot(spec),
         ModuleSpec::Command(spec) => command_snapshot(spec),
         ModuleSpec::GitHub(spec) => github_snapshot(spec),
+        ModuleSpec::GitLab(spec) => gitlab_snapshot(spec),
+        ModuleSpec::StatusPage(spec) => statuspage_snapshot(spec),
         ModuleSpec::Usage(spec) => usage_snapshot(spec),
         ModuleSpec::Cpu(spec) => cpu_snapshot(spec),
         ModuleSpec::Memory(spec) => memory_snapshot(spec),
@@ -207,6 +211,8 @@ impl SnapshotStore {
             ModuleSpec::Clock(spec) => clock_snapshot(spec),
             ModuleSpec::Command(spec) => command_snapshot(spec),
             ModuleSpec::GitHub(spec) => github_snapshot(spec),
+            ModuleSpec::GitLab(spec) => gitlab_snapshot(spec),
+            ModuleSpec::StatusPage(spec) => statuspage_snapshot(spec),
             ModuleSpec::Usage(spec) => usage_snapshot(spec),
             ModuleSpec::Cpu(spec) => cpu_snapshot(spec),
             ModuleSpec::Memory(spec) => memory_snapshot(spec),
@@ -714,6 +720,155 @@ fn workflow_is_api_id(workflow: &str) -> bool {
         || workflow.ends_with(".yaml")
 }
 
+fn gitlab_snapshot(spec: &GitLabSpec) -> ModuleSnapshot {
+    let project = encode_project_path(&spec.project);
+    let mut endpoint = format!("projects/{project}/pipelines?per_page=1");
+    if let Some(branch) = &spec.branch {
+        endpoint.push_str("&ref=");
+        endpoint.push_str(branch);
+    }
+
+    let mut args: Vec<&str> = vec!["api"];
+    if let Some(host) = spec.host.as_deref() {
+        args.push("--hostname");
+        args.push(host);
+    }
+    args.push(&endpoint);
+
+    let mut envs = Vec::new();
+    if let Some(token_env) = &spec.token_env {
+        if let Ok(token) = std::env::var(token_env) {
+            envs.push(("GITLAB_TOKEN", token));
+        }
+    }
+
+    match run_command("glab", &args, &envs) {
+        Ok(text) => parse_gitlab_pipelines(spec, &text).unwrap_or_else(|| {
+            error_snapshot(&spec.id, gitlab_title(spec), "no pipelines", spec.interval)
+        }),
+        Err(err) => error_snapshot(&spec.id, gitlab_title(spec), err, spec.interval),
+    }
+}
+
+/// Display title for a gitlab module: the configured `title`, else the project.
+fn gitlab_title(spec: &GitLabSpec) -> &str {
+    spec.title.as_deref().unwrap_or(&spec.project)
+}
+
+fn parse_gitlab_pipelines(spec: &GitLabSpec, text: &str) -> Option<ModuleSnapshot> {
+    // The list endpoint returns a JSON array, newest pipeline first.
+    let json: Value = serde_json::from_str(text).ok()?;
+    let pipeline = json.as_array()?.first()?;
+    let status = pipeline
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let branch = pipeline
+        .get("ref")
+        .and_then(Value::as_str)
+        .or(spec.branch.as_deref());
+    let source = pipeline.get("source").and_then(Value::as_str);
+
+    let (label, module_status) = match status {
+        "success" => ("success".to_string(), ModuleStatus::Ok),
+        "failed" => ("failed".to_string(), ModuleStatus::Critical),
+        "canceled" | "skipped" | "manual" => (status.to_string(), ModuleStatus::Warning),
+        "running" | "pending" | "created" | "preparing" | "waiting_for_resource" | "scheduled" => {
+            (status.replace('_', " "), ModuleStatus::Info)
+        }
+        other => (other.replace('_', " "), ModuleStatus::Unknown),
+    };
+
+    let detail = match (source, branch) {
+        (Some(source), Some(branch)) => Some(format!("{source} @ {branch}")),
+        (Some(source), None) => Some(source.to_string()),
+        (None, Some(branch)) => Some(branch.to_string()),
+        (None, None) => None,
+    };
+
+    Some(ModuleSnapshot {
+        id: spec.id.clone(),
+        title: gitlab_title(spec).to_string(),
+        value: ModuleValue::State { label, detail },
+        status: module_status,
+        updated_at: Some(SystemTime::now()),
+        stale_after: Some(spec.interval),
+    })
+}
+
+/// Percent-encode a project path for a GitLab REST path segment: `group/name`
+/// becomes `group%2Fname`. A numeric project id passes through unchanged.
+/// GitLab path segments are restricted to `[A-Za-z0-9._-]`, so only the `/`
+/// separators need escaping.
+fn encode_project_path(project: &str) -> String {
+    project.replace('/', "%2F")
+}
+
+fn statuspage_snapshot(spec: &StatusPageSpec) -> ModuleSnapshot {
+    match fetch_statuspage(spec) {
+        Ok(snapshot) => snapshot,
+        Err(err) => error_snapshot(&spec.id, statuspage_title(spec), err, spec.interval),
+    }
+}
+
+/// Display title for a statuspage module: the configured `title`, else `status`.
+fn statuspage_title(spec: &StatusPageSpec) -> &str {
+    spec.title.as_deref().unwrap_or("status")
+}
+
+fn fetch_statuspage(spec: &StatusPageSpec) -> Result<ModuleSnapshot, String> {
+    let base = spec.url.trim_end_matches('/');
+    let url = format!("{base}/api/v2/summary.json");
+    let response = HTTP
+        .get(&url)
+        .set("User-Agent", "prism-widgets")
+        .call()
+        .map_err(|err| first_line(&err.to_string()))?;
+    let text = response.into_string().map_err(|err| err.to_string())?;
+    let json: Value = serde_json::from_str(&text).map_err(|err| format!("invalid JSON: {err}"))?;
+    parse_statuspage(spec, &json).ok_or_else(|| "unrecognized status response".to_string())
+}
+
+/// Map an Atlassian Statuspage `summary.json` into a status. Only `status.
+/// indicator == "none"` is OK (which collapses the module out of the panel);
+/// every other indicator surfaces the service description plus, when present,
+/// the name of the first listed incident.
+fn parse_statuspage(spec: &StatusPageSpec, json: &Value) -> Option<ModuleSnapshot> {
+    let status = json.get("status")?;
+    let indicator = status
+        .get("indicator")
+        .and_then(Value::as_str)
+        .unwrap_or("none");
+    let module_status = match indicator {
+        "none" => ModuleStatus::Ok,
+        "minor" => ModuleStatus::Warning,
+        "major" | "critical" => ModuleStatus::Critical,
+        // Anything unrecognized (including maintenance) is worth surfacing.
+        _ => ModuleStatus::Warning,
+    };
+    let label = status
+        .get("description")
+        .and_then(Value::as_str)
+        .unwrap_or(indicator)
+        .to_string();
+    let detail = json
+        .get("incidents")
+        .and_then(Value::as_array)
+        .and_then(|incidents| incidents.first())
+        .and_then(|incident| incident.get("name"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+
+    Some(ModuleSnapshot {
+        id: spec.id.clone(),
+        title: statuspage_title(spec).to_string(),
+        value: ModuleValue::State { label, detail },
+        status: module_status,
+        updated_at: Some(SystemTime::now()),
+        stale_after: Some(spec.interval),
+    })
+}
+
 fn json_snapshot(text: &str, id: &str, title: &str, interval: Duration) -> Option<ModuleSnapshot> {
     let json: Value = serde_json::from_str(text).ok()?;
     let status = json_status(&json);
@@ -800,14 +955,25 @@ struct ClaudeUsage {
     plan: Option<String>,
     five_hour: Option<ClaudeUsageWindow>,
     seven_day: Option<ClaudeUsageWindow>,
-    sonnet: Option<ClaudeUsageWindow>,
-    opus: Option<ClaudeUsageWindow>,
+    /// Per-model weekly limits from the API's `limits` array (e.g. Fable),
+    /// in API order, selected for display by name via the config `windows`
+    /// tokens. The legacy `seven_day_opus`/`seven_day_sonnet` fields the API
+    /// still returns are always null now; per-model usage lives here.
+    model_limits: Vec<ClaudeModelLimit>,
 }
 
 #[derive(Debug)]
 struct ClaudeUsageWindow {
     utilization: f64,
     resets_at: Option<String>,
+}
+
+#[derive(Debug)]
+struct ClaudeModelLimit {
+    /// Model display name as reported by the API, e.g. "Fable".
+    name: String,
+    /// Percent of the model's weekly allowance consumed (0..=100).
+    utilization: f64,
 }
 
 #[derive(Debug)]
@@ -834,23 +1000,11 @@ struct CodexUsageCredits {
 
 impl ClaudeUsage {
     fn into_snapshot(self, spec: &UsageSpec) -> ModuleSnapshot {
-        let highest = [
-            self.five_hour.as_ref().map(|window| window.utilization),
-            self.seven_day.as_ref().map(|window| window.utilization),
-            self.sonnet_pct(),
-            self.opus_pct(),
-        ]
-        .into_iter()
-        .flatten()
-        .fold(0.0, f64::max);
-
-        let mut gauges = Vec::new();
-        if let Some(window) = &self.five_hour {
-            gauges.push(gauge("5h", window.utilization));
-        }
-        if let Some(window) = &self.seven_day {
-            gauges.push(gauge("7d", window.utilization));
-        }
+        let gauges = self.selected_gauges(spec);
+        let highest = gauges
+            .iter()
+            .map(|gauge| gauge.percent as f64)
+            .fold(0.0, f64::max);
 
         let mut details = Vec::new();
         if let Some(plan) = self.plan {
@@ -876,12 +1030,39 @@ impl ClaudeUsage {
         }
     }
 
-    fn sonnet_pct(&self) -> Option<f64> {
-        self.sonnet.as_ref().map(|window| window.utilization)
+    /// Resolve the configured `windows` tokens into gauges, in order. With no
+    /// `windows` configured the default is `5h 7d`, preserving prior behaviour.
+    fn selected_gauges(&self, spec: &UsageSpec) -> Vec<Gauge> {
+        let default = [String::from("5h"), String::from("7d")];
+        let tokens = spec.windows.as_deref().unwrap_or(&default[..]);
+        tokens
+            .iter()
+            .filter_map(|token| self.resolve_gauge(token))
+            .collect()
     }
 
-    fn opus_pct(&self) -> Option<f64> {
-        self.opus.as_ref().map(|window| window.utilization)
+    /// Map one window token to a gauge. `5h`/`session` and `7d`/`weekly` select
+    /// the aggregate windows; any other token is a model name matched
+    /// case-insensitively against the per-model weekly limits (e.g. `fable` →
+    /// the "Fable" limit). A token the API did not report resolves to `None`
+    /// and is skipped.
+    fn resolve_gauge(&self, token: &str) -> Option<Gauge> {
+        match token.trim().to_ascii_lowercase().as_str() {
+            "" => None,
+            "5h" | "5hr" | "5hour" | "five_hour" | "session" => self
+                .five_hour
+                .as_ref()
+                .map(|window| gauge("5h", window.utilization)),
+            "7d" | "7day" | "week" | "weekly" | "seven_day" => self
+                .seven_day
+                .as_ref()
+                .map(|window| gauge("7d", window.utilization)),
+            name => self
+                .model_limits
+                .iter()
+                .find(|limit| limit.name.eq_ignore_ascii_case(name))
+                .map(|limit| gauge(&limit.name, limit.utilization)),
+        }
     }
 }
 
@@ -1237,8 +1418,7 @@ fn fetch_claude_usage(spec: &UsageSpec) -> Result<ClaudeUsage, String> {
         plan,
         five_hour: claude_window(&json, "five_hour"),
         seven_day: claude_window(&json, "seven_day"),
-        sonnet: claude_window(&json, "seven_day_sonnet"),
-        opus: claude_window(&json, "seven_day_opus"),
+        model_limits: claude_model_limits(&json),
     })
 }
 
@@ -1528,6 +1708,31 @@ fn claude_window(json: &Value, key: &str) -> Option<ClaudeUsageWindow> {
     })
 }
 
+/// Per-model weekly limits from the `limits` array. Only entries carrying a
+/// `scope.model.display_name` are kept (the model-scoped limits, e.g. Fable);
+/// the aggregate session/weekly entries have a null scope and are read instead
+/// from the top-level `five_hour`/`seven_day` fields.
+fn claude_model_limits(json: &Value) -> Vec<ClaudeModelLimit> {
+    let Some(limits) = json.get("limits").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    limits
+        .iter()
+        .filter_map(|entry| {
+            let name = entry
+                .get("scope")?
+                .get("model")?
+                .get("display_name")
+                .and_then(Value::as_str)?;
+            let utilization = entry.get("percent").and_then(Value::as_f64)?;
+            Some(ClaudeModelLimit {
+                name: name.to_string(),
+                utilization,
+            })
+        })
+        .collect()
+}
+
 fn usage_title(spec: &UsageSpec) -> String {
     match (&spec.source[..], spec.account.as_deref()) {
         ("claude", Some(account)) => format!("claude {account}"),
@@ -1755,6 +1960,180 @@ mod tests {
         );
         spec.title = Some("shortname".into());
         assert_eq!(github_title(&spec), "shortname");
+    }
+
+    fn gitlab_spec() -> GitLabSpec {
+        GitLabSpec {
+            id: "gitlab:group/app".into(),
+            project: "group/app".into(),
+            title: None,
+            branch: None,
+            host: None,
+            interval: Duration::from_secs(60),
+            token_env: None,
+        }
+    }
+
+    #[test]
+    fn gitlab_pipeline_maps_status_and_detail() {
+        let text = r#"[
+            {"id": 42, "status": "success", "ref": "main", "source": "push"},
+            {"id": 41, "status": "failed", "ref": "main", "source": "push"}
+        ]"#;
+        let snap = parse_gitlab_pipelines(&gitlab_spec(), text).expect("parses newest pipeline");
+        assert_eq!(snap.status, ModuleStatus::Ok);
+        assert_eq!(snap.title, "group/app");
+        match snap.value {
+            ModuleValue::State { label, detail } => {
+                assert_eq!(label, "success");
+                assert_eq!(detail.as_deref(), Some("push @ main"));
+            }
+            other => panic!("expected State, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gitlab_failed_pipeline_is_critical() {
+        let text = r#"[{"id": 7, "status": "failed", "ref": "dev", "source": "schedule"}]"#;
+        let snap = parse_gitlab_pipelines(&gitlab_spec(), text).unwrap();
+        assert_eq!(snap.status, ModuleStatus::Critical);
+    }
+
+    #[test]
+    fn gitlab_empty_list_yields_no_snapshot() {
+        assert!(parse_gitlab_pipelines(&gitlab_spec(), "[]").is_none());
+    }
+
+    #[test]
+    fn gitlab_project_path_encodes_slashes_only() {
+        assert_eq!(encode_project_path("group/sub/app"), "group%2Fsub%2Fapp");
+        assert_eq!(encode_project_path("12345"), "12345");
+    }
+
+    fn statuspage_spec() -> StatusPageSpec {
+        StatusPageSpec {
+            id: "https://status.claude.com".into(),
+            url: "https://status.claude.com".into(),
+            title: None,
+            interval: Duration::from_secs(300),
+        }
+    }
+
+    #[test]
+    fn statuspage_operational_is_ok_and_collapses() {
+        let json: Value = serde_json::from_str(
+            r#"{ "status": { "indicator": "none", "description": "All Systems Operational" },
+                 "incidents": [] }"#,
+        )
+        .unwrap();
+        let snap = parse_statuspage(&statuspage_spec(), &json).unwrap();
+        assert_eq!(snap.status, ModuleStatus::Ok);
+        // An OK statuspage hides itself from the panel.
+        let spec = ModuleSpec::StatusPage(statuspage_spec());
+        assert!(collapse_snapshot(&spec, Some(snap)).is_none());
+    }
+
+    #[test]
+    fn statuspage_outage_surfaces_description_and_incident() {
+        let json: Value = serde_json::from_str(
+            r#"{ "status": { "indicator": "minor", "description": "Minor Service Outage" },
+                 "incidents": [ { "name": "Elevated API errors", "status": "investigating" } ] }"#,
+        )
+        .unwrap();
+        let snap = parse_statuspage(&statuspage_spec(), &json).unwrap();
+        assert_eq!(snap.status, ModuleStatus::Warning);
+        match &snap.value {
+            ModuleValue::State { label, detail } => {
+                assert_eq!(label, "Minor Service Outage");
+                assert_eq!(detail.as_deref(), Some("Elevated API errors"));
+            }
+            other => panic!("expected State, got {other:?}"),
+        }
+        // A degraded statuspage is shown, not collapsed.
+        let spec = ModuleSpec::StatusPage(statuspage_spec());
+        assert!(collapse_snapshot(&spec, Some(snap)).is_some());
+    }
+
+    #[test]
+    fn statuspage_major_indicator_is_critical() {
+        let json: Value = serde_json::from_str(
+            r#"{ "status": { "indicator": "major", "description": "Partial Outage" } }"#,
+        )
+        .unwrap();
+        let snap = parse_statuspage(&statuspage_spec(), &json).unwrap();
+        assert_eq!(snap.status, ModuleStatus::Critical);
+    }
+
+    // Shape drawn from a live /api/oauth/usage response: aggregate windows in
+    // `five_hour`/`seven_day`, per-model usage only in the `limits` array under
+    // a `weekly_scoped` entry, and the legacy `seven_day_*` model keys null.
+    const CLAUDE_USAGE_SAMPLE: &str = r#"{
+      "five_hour": { "utilization": 8.0, "resets_at": "2026-07-19T16:29:59+00:00" },
+      "seven_day": { "utilization": 51.0, "resets_at": "2026-07-22T22:59:59+00:00" },
+      "seven_day_opus": null,
+      "seven_day_sonnet": null,
+      "limits": [
+        { "kind": "session", "percent": 8, "scope": null },
+        { "kind": "weekly_all", "percent": 51, "scope": null },
+        { "kind": "weekly_scoped", "percent": 96,
+          "scope": { "model": { "display_name": "Fable", "id": null } } }
+      ]
+    }"#;
+
+    fn claude_usage_spec(windows: Option<&[&str]>) -> UsageSpec {
+        UsageSpec {
+            id: "claude".into(),
+            source: "claude".into(),
+            account: None,
+            claude_dir: None,
+            codex_home: None,
+            auth_path: None,
+            base_url: None,
+            api_key_env: None,
+            windows: windows.map(|w| w.iter().map(ToString::to_string).collect()),
+            interval: Duration::from_secs(300),
+        }
+    }
+
+    fn parse_claude_sample() -> ClaudeUsage {
+        let json: Value = serde_json::from_str(CLAUDE_USAGE_SAMPLE).unwrap();
+        ClaudeUsage {
+            plan: None,
+            five_hour: claude_window(&json, "five_hour"),
+            seven_day: claude_window(&json, "seven_day"),
+            model_limits: claude_model_limits(&json),
+        }
+    }
+
+    #[test]
+    fn claude_model_limits_keeps_scoped_models_only() {
+        let usage = parse_claude_sample();
+        // Only the model-scoped entry survives; the null-scope aggregates are
+        // read from the top-level windows instead.
+        assert_eq!(usage.model_limits.len(), 1);
+        assert_eq!(usage.model_limits[0].name, "Fable");
+        assert_eq!(usage.model_limits[0].utilization, 96.0);
+    }
+
+    #[test]
+    fn selected_gauges_default_is_five_hour_and_seven_day() {
+        let usage = parse_claude_sample();
+        let gauges = usage.selected_gauges(&claude_usage_spec(None));
+        let labels: Vec<_> = gauges.iter().map(|g| g.label.as_str()).collect();
+        assert_eq!(labels, ["5h", "7d"]);
+    }
+
+    #[test]
+    fn selected_gauges_resolves_model_token_case_insensitively_and_skips_unknown() {
+        let usage = parse_claude_sample();
+        let gauges = usage.selected_gauges(&claude_usage_spec(Some(&["5h", "fable", "opus"])));
+        // "fable" matches the scoped "Fable" model; "opus" isn't reported by
+        // the API and is silently dropped rather than showing an empty bar.
+        let resolved: Vec<_> = gauges
+            .iter()
+            .map(|g| (g.label.as_str(), g.percent))
+            .collect();
+        assert_eq!(resolved, [("5h", 8.0), ("Fable", 96.0)]);
     }
 
     #[test]

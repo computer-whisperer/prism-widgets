@@ -39,8 +39,8 @@ use damascene_core::BuildCx;
 use damascene_wgpu::{MsaaTarget, Runner, RunnerCaps};
 
 use prism_widgets_core::{
-    clock_snapshot, ModuleSnapshot, ModuleSpec, ModuleUpdate, PanelAnchor, PanelId, PanelLayer,
-    PanelLayout, PanelSnapshot, PanelSpec,
+    clock_snapshot, ModuleSnapshot, ModuleSpec, ModuleStatus, ModuleUpdate, PanelAnchor, PanelId,
+    PanelLayer, PanelLayout, PanelSnapshot, PanelSpec,
 };
 use prism_widgets_ui::{PanelView, WidgetsBandApp};
 
@@ -137,17 +137,38 @@ impl PanelDataSource for SnapshotCache {
                 modules: panel
                     .modules
                     .iter()
-                    .map(|spec| match spec {
-                        ModuleSpec::Clock(clock) => clock_snapshot(clock),
-                        _ => self
+                    .filter_map(|spec| {
+                        if let ModuleSpec::Clock(clock) = spec {
+                            return Some(clock_snapshot(clock));
+                        }
+                        let cached = self
                             .modules
                             .get(&(panel.id.0.clone(), spec.id().to_string()))
-                            .cloned()
-                            .unwrap_or_else(|| ModuleSnapshot::loading(spec.id(), spec.id())),
+                            .cloned();
+                        collapse_snapshot(spec, cached)
                     })
                     .collect(),
             })
             .unwrap_or_else(|| PanelSnapshot::empty(panel_id.clone()))
+    }
+}
+
+/// Resolve a module's latest snapshot into what the panel should draw.
+///
+/// `snapshot` is the freshest value for the module, or `None` when nothing has
+/// been polled yet. Collapsible modules (see [`ModuleSpec::hides_when_ok`], e.g.
+/// statuspage) are omitted while their status is OK — or before their first
+/// poll — so they surface only on an outage; every other module falls back to a
+/// loading placeholder until its first snapshot arrives.
+pub fn collapse_snapshot(
+    spec: &ModuleSpec,
+    snapshot: Option<ModuleSnapshot>,
+) -> Option<ModuleSnapshot> {
+    match snapshot {
+        Some(snap) if spec.hides_when_ok() && snap.status == ModuleStatus::Ok => None,
+        Some(snap) => Some(snap),
+        None if spec.hides_when_ok() => None,
+        None => Some(ModuleSnapshot::loading(spec.id(), spec.id())),
     }
 }
 
@@ -423,6 +444,7 @@ impl LayerHost {
                     power_preference: wgpu::PowerPreference::default(),
                     compatible_surface: Some(&wgpu_surface),
                     force_fallback_adapter: false,
+                    apply_limit_buckets: false,
                 }))
                 .expect("no compatible adapter");
             let (device, queue) =
@@ -1112,6 +1134,7 @@ fn setup_swapchain(
             let config = wgpu::SurfaceConfiguration {
                 usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
                 format,
+                color_space: wgpu::SurfaceColorSpace::Auto,
                 width,
                 height,
                 present_mode: wgpu::PresentMode::Fifo,
@@ -1184,7 +1207,7 @@ fn render_frame<A: App>(
 
     app.before_build();
     let theme = app.theme();
-    let mut tree = {
+    let tree = {
         let cx = BuildCx::new(&theme)
             .with_ui_state(sc.runner.ui_state())
             .with_viewport(viewport.w, viewport.h);
@@ -1195,7 +1218,7 @@ fn render_frame<A: App>(
 
     let prepare = sc
         .runner
-        .prepare(&gpu.device, &gpu.queue, &mut tree, viewport, scale as f32);
+        .prepare(&gpu.device, &gpu.queue, tree, viewport, scale as f32);
 
     let frame = match target.wgpu.get_current_texture() {
         wgpu::CurrentSurfaceTexture::Success(texture)
@@ -1241,7 +1264,7 @@ fn render_frame<A: App>(
     target
         .wl_surface
         .frame(target.qh, target.wl_surface.clone());
-    frame.present();
+    gpu.queue.present(frame);
 
     let mut anim_deadline = prepare.next_redraw_in.map(|delay| Instant::now() + delay);
     if prepare.needs_redraw && anim_deadline.is_none() {
@@ -1261,7 +1284,7 @@ mod tests {
 
     use prism_widgets_core::{
         ClockSpec, CommandSpec, ModuleStatus, ModuleValue, PanelAppearance, PanelGeometry,
-        ThemeName,
+        StatusPageSpec, ThemeName,
     };
 
     fn panel(id: &str, modules: Vec<ModuleSpec>) -> PanelSpec {
@@ -1326,6 +1349,15 @@ mod tests {
         }
     }
 
+    fn statuspage(id: &str) -> ModuleSpec {
+        ModuleSpec::StatusPage(StatusPageSpec {
+            id: id.into(),
+            url: "https://status.example.com".into(),
+            title: None,
+            interval: Duration::from_secs(300),
+        })
+    }
+
     #[test]
     fn clock_renders_live_while_unfetched_modules_show_a_placeholder() {
         let spec = panel("p", vec![clock("clk"), command("cmd")]);
@@ -1336,6 +1368,40 @@ mod tests {
         assert_eq!(snapshot.modules[0].id, "clk");
         assert!(matches!(snapshot.modules[0].value, ModuleValue::Text(_)));
         assert_eq!(snapshot.modules[1].status, ModuleStatus::Unknown);
+    }
+
+    #[test]
+    fn collapsible_module_is_hidden_until_it_reports_trouble() {
+        // Before any poll, a non-collapsible module shows a loading placeholder
+        // while a collapsible statuspage is omitted entirely.
+        assert!(collapse_snapshot(&command("cmd"), None).is_some());
+        assert!(collapse_snapshot(&statuspage("s"), None).is_none());
+
+        // An OK statuspage stays hidden; a degraded one is shown.
+        let mut snap = cmd_state("ok");
+        snap.status = ModuleStatus::Ok;
+        assert!(collapse_snapshot(&statuspage("s"), Some(snap.clone())).is_none());
+        snap.status = ModuleStatus::Critical;
+        assert!(collapse_snapshot(&statuspage("s"), Some(snap)).is_some());
+    }
+
+    #[test]
+    fn healthy_statuspage_drops_out_of_the_assembled_panel() {
+        let spec = panel("p", vec![clock("clk"), statuspage("s")]);
+        let mut cache = SnapshotCache::from_specs(std::slice::from_ref(&spec));
+        let mut ok = cmd_state("operational");
+        ok.status = ModuleStatus::Ok;
+        cache.apply(ModuleUpdate {
+            epoch: 0,
+            panel: PanelId::new("p"),
+            module: "s".into(),
+            snapshot: ok,
+        });
+
+        let snapshot = cache.snapshot_for(&PanelId::new("p"));
+        // Only the clock survives; the operational statuspage is collapsed out.
+        assert_eq!(snapshot.modules.len(), 1);
+        assert_eq!(snapshot.modules[0].id, "clk");
     }
 
     #[test]

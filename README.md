@@ -93,6 +93,16 @@ usage source="claude" id="claude-personal" account="personal" claude-dir="~/.cla
 usage source="claude" id="claude-work" account="work" claude-dir="~/.claude-work" interval=300
 ```
 
+By default the claude widget draws two gauges: `5h` (five-hour session) and
+`7d` (seven-day). Set `windows` to choose which gauges show, in order. Besides
+`5h` and `7d`, a token is treated as a model name and matched against the
+API's per-model weekly limits — e.g. `fable` draws the "Fable" weekly gauge. A
+token the API isn't currently reporting is skipped rather than shown empty:
+
+```kdl
+usage source="claude" claude-dir="~/.claude" windows="5h 7d fable" interval=300
+```
+
 `usage source="codex"` reads Codex CLI auth from `$HOME/.codex/auth.json` by
 default. It refreshes the OAuth access token when needed, then calls
 ChatGPT's `/backend-api/wham/usage` endpoint using the same subscription auth
@@ -111,6 +121,30 @@ Any other `usage` source uses the `SOURCE-usage-json` helper convention. A
 `workflow=` accepts a workflow file/ID or filters recent runs by display name.
 `title=` overrides the displayed label, so a long `owner/name` repo can show
 as a short name instead of being ellipsized in a sidebar.
+
+`gitlab` is the GitLab counterpart: it uses the `glab` CLI (`glab api`) and maps
+the newest pipeline for the project into a status. `project=` is the project
+path (`group/name`, may be nested) or numeric id; `branch=` filters by ref;
+`host=` targets a self-hosted instance (passed to `glab --hostname`); `token-env=`
+names an env var exported to `glab` as `GITLAB_TOKEN`. It requires `glab` to be
+installed and authenticated (`glab auth login`).
+
+```kdl
+gitlab project="gitlab-org/gitlab" branch="master" interval=60
+gitlab project="mygroup/app" title="app" host="gitlab.example.com" token-env="GITLAB_TOKEN" interval=60
+```
+
+`statuspage` polls an Atlassian Statuspage (`<url>/api/v2/summary.json`, the
+format status.claude.com and many other services publish) and is *collapsible*:
+it stays hidden while everything is operational and appears — as a warning or
+critical badge with the incident description — only during a reported outage.
+`url=` defaults to `https://status.claude.com`; set `title=` for the label. It
+needs no auth. Point it at any Statuspage-backed service:
+
+```kdl
+statuspage interval=300                                                  // claude
+statuspage url="https://www.githubstatus.com" title="github" interval=300
+```
 
 `cpu`, `memory`, and `gpu` read local system load directly from `/proc` and
 `/sys` (no extra tooling) and render as stacked percentage meters with a

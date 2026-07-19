@@ -3,9 +3,9 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use prism_widgets_core::{
-    ClockSpec, CommandSpec, CpuSpec, GitHubSpec, GpuSpec, MemorySpec, ModuleSpec, PanelAnchor,
-    PanelAppearance, PanelGeometry, PanelId, PanelLayer, PanelLayout, PanelSpec, ThemeName,
-    UsageSpec,
+    ClockSpec, CommandSpec, CpuSpec, GitHubSpec, GitLabSpec, GpuSpec, MemorySpec, ModuleSpec,
+    PanelAnchor, PanelAppearance, PanelGeometry, PanelId, PanelLayer, PanelLayout, PanelSpec,
+    StatusPageSpec, ThemeName, UsageSpec,
 };
 
 #[derive(Debug, knuffel::Decode)]
@@ -69,6 +69,8 @@ enum ModuleNode {
     Clock(ClockNode),
     Command(CommandNode),
     Github(GitHubNode),
+    Gitlab(GitLabNode),
+    Statuspage(StatusPageNode),
     Usage(UsageNode),
     Cpu(CpuNode),
     Memory(MemoryNode),
@@ -112,6 +114,36 @@ struct GitHubNode {
 }
 
 #[derive(Debug, knuffel::Decode)]
+struct GitLabNode {
+    #[knuffel(property)]
+    project: String,
+    #[knuffel(property)]
+    id: Option<String>,
+    #[knuffel(property)]
+    title: Option<String>,
+    #[knuffel(property)]
+    branch: Option<String>,
+    #[knuffel(property)]
+    host: Option<String>,
+    #[knuffel(property(name = "token-env"))]
+    token_env: Option<String>,
+    #[knuffel(property, default = 60)]
+    interval: u64,
+}
+
+#[derive(Debug, knuffel::Decode)]
+struct StatusPageNode {
+    #[knuffel(property, default = String::from("https://status.claude.com"))]
+    url: String,
+    #[knuffel(property)]
+    id: Option<String>,
+    #[knuffel(property)]
+    title: Option<String>,
+    #[knuffel(property, default = 300)]
+    interval: u64,
+}
+
+#[derive(Debug, knuffel::Decode)]
 struct UsageNode {
     #[knuffel(property)]
     source: String,
@@ -129,6 +161,10 @@ struct UsageNode {
     base_url: Option<String>,
     #[knuffel(property(name = "api-key-env"))]
     api_key_env: Option<String>,
+    /// Space/comma-separated usage windows to show as gauges (claude only),
+    /// e.g. `windows="5h 7d fable"`. Unset shows `5h 7d`.
+    #[knuffel(property)]
+    windows: Option<String>,
     #[knuffel(property, default = 300)]
     interval: u64,
 }
@@ -333,6 +369,15 @@ impl Config {
                     ModuleNode::Github(github) if github.interval == 0 => {
                         anyhow::bail!("github {:?}: interval must be at least 1", github.repo);
                     }
+                    ModuleNode::Gitlab(gitlab) if gitlab.interval == 0 => {
+                        anyhow::bail!("gitlab {:?}: interval must be at least 1", gitlab.project);
+                    }
+                    ModuleNode::Statuspage(statuspage) if statuspage.interval == 0 => {
+                        anyhow::bail!(
+                            "statuspage {:?}: interval must be at least 1",
+                            statuspage.url
+                        );
+                    }
                     ModuleNode::Usage(usage) if usage.interval == 0 => {
                         anyhow::bail!("usage {:?}: interval must be at least 1", usage.source);
                     }
@@ -468,6 +513,30 @@ impl ModuleNode {
                 interval: Duration::from_secs(github.interval),
                 token_env: github.token_env.clone(),
             }),
+            ModuleNode::Gitlab(gitlab) => ModuleSpec::GitLab(GitLabSpec {
+                // Default id carries a `gitlab:` marker so the UI shows the
+                // GitLab brand icon: a bare `group/project` id is
+                // indistinguishable from a GitHub `owner/repo`.
+                id: gitlab
+                    .id
+                    .clone()
+                    .unwrap_or_else(|| format!("gitlab:{}", gitlab.project)),
+                project: gitlab.project.clone(),
+                title: gitlab.title.clone(),
+                branch: gitlab.branch.clone(),
+                host: gitlab.host.clone(),
+                interval: Duration::from_secs(gitlab.interval),
+                token_env: gitlab.token_env.clone(),
+            }),
+            ModuleNode::Statuspage(statuspage) => ModuleSpec::StatusPage(StatusPageSpec {
+                id: statuspage
+                    .id
+                    .clone()
+                    .unwrap_or_else(|| statuspage.url.clone()),
+                url: statuspage.url.clone(),
+                title: statuspage.title.clone(),
+                interval: Duration::from_secs(statuspage.interval),
+            }),
             ModuleNode::Usage(usage) => ModuleSpec::Usage(UsageSpec {
                 id: usage.id.clone().unwrap_or_else(|| usage.source.clone()),
                 source: usage.source.clone(),
@@ -477,6 +546,12 @@ impl ModuleNode {
                 auth_path: usage.auth_path.clone(),
                 base_url: usage.base_url.clone(),
                 api_key_env: usage.api_key_env.clone(),
+                windows: usage.windows.as_ref().map(|raw| {
+                    raw.split(|c: char| c.is_whitespace() || c == ',')
+                        .filter(|token| !token.is_empty())
+                        .map(str::to_string)
+                        .collect()
+                }),
                 interval: Duration::from_secs(usage.interval),
             }),
             ModuleNode::Cpu(cpu) => ModuleSpec::Cpu(CpuSpec {

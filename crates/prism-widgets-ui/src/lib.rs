@@ -9,11 +9,14 @@ use prism_widgets_core::{
 };
 
 const GITHUB_SVG: &str = include_str!("../assets/icons/github.svg");
+const GITLAB_SVG: &str = include_str!("../assets/icons/gitlab.svg");
 const OPENAI_SVG: &str = include_str!("../assets/icons/openai.svg");
 const ANTHROPIC_SVG: &str = include_str!("../assets/icons/anthropic.svg");
 
 static ICON_GITHUB: LazyLock<SvgIcon> =
     LazyLock::new(|| SvgIcon::parse_current_color(GITHUB_SVG).expect("parse github.svg"));
+static ICON_GITLAB: LazyLock<SvgIcon> =
+    LazyLock::new(|| SvgIcon::parse_current_color(GITLAB_SVG).expect("parse gitlab.svg"));
 static ICON_OPENAI: LazyLock<SvgIcon> =
     LazyLock::new(|| SvgIcon::parse_current_color(OPENAI_SVG).expect("parse openai.svg"));
 static ICON_ANTHROPIC: LazyLock<SvgIcon> =
@@ -445,6 +448,7 @@ fn metric_color(percent: f32) -> Color {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BrandIconKind {
     GitHub,
+    GitLab,
     OpenAi,
     Anthropic,
 }
@@ -452,6 +456,7 @@ enum BrandIconKind {
 fn module_brand_icon(module: &ModuleSnapshot) -> Option<SvgIcon> {
     match module_brand_icon_kind(module)? {
         BrandIconKind::GitHub => Some(ICON_GITHUB.clone()),
+        BrandIconKind::GitLab => Some(ICON_GITLAB.clone()),
         BrandIconKind::OpenAi => Some(ICON_OPENAI.clone()),
         BrandIconKind::Anthropic => Some(ICON_ANTHROPIC.clone()),
     }
@@ -465,6 +470,11 @@ fn module_brand_icon_kind(module: &ModuleSnapshot) -> Option<BrandIconKind> {
     }
     if id.starts_with("claude") || title.starts_with("claude") || title.contains("anthropic") {
         return Some(BrandIconKind::Anthropic);
+    }
+    // GitLab before GitHub: both carry an `owner/project` slash, so the
+    // provider marks gitlab modules with a `gitlab:` id prefix to disambiguate.
+    if id.contains("gitlab") || title.contains("gitlab") {
+        return Some(BrandIconKind::GitLab);
     }
     if id.contains('/') || title.contains('/') || title.contains("github") {
         return Some(BrandIconKind::GitHub);
@@ -545,6 +555,13 @@ mod tests {
                 "computer-whisperer/prism"
             )),
             Some(BrandIconKind::GitHub)
+        );
+        // GitLab modules carry a `gitlab:` id prefix; the display title is a
+        // bare slashed path, so detection must key off the marker and win over
+        // the GitHub slash rule.
+        assert_eq!(
+            module_brand_icon_kind(&module_with_identity("gitlab:group/app", "group/app")),
+            Some(BrandIconKind::GitLab)
         );
         assert_eq!(
             module_brand_icon_kind(&module_with_identity("clock", "clock")),
