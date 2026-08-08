@@ -51,6 +51,10 @@ const MAX_IMAGE_BYTES: usize = 16 * 1024 * 1024;
 /// evicted (entirely) to stay under it, so a run of screenshots can't pin
 /// hundreds of megabytes.
 const IMAGE_BUDGET_BYTES: usize = 64 * 1024 * 1024;
+// The eviction loop's newest-entry exemption is positional (index 0). It is
+// only guaranteed to shield the just-pushed *image* because a single image
+// can never exceed the budget by itself — which this pins down:
+const _: () = assert!(MAX_IMAGE_BYTES <= IMAGE_BUDGET_BYTES);
 /// Thumbnail bounding box, logical pixels (aspect preserved within it).
 const THUMB_MAX_W: u32 = 220;
 const THUMB_MAX_H: u32 = 64;
@@ -114,6 +118,20 @@ impl Payload {
         match self {
             Payload::Text(text) | Payload::Uris(text) => text.as_bytes(),
             Payload::Image { bytes, .. } => bytes,
+        }
+    }
+
+    /// Bytes to serve for a specific requested mime. Uri-list bodies come
+    /// off the wire with RFC 2483 CRLF line endings and percent-encoding;
+    /// serving that verbatim as text/plain pastes literal `\r` into
+    /// editors, so the plain-text offers get a newline-joined rendering
+    /// while `text/uri-list` receivers get the verbatim body.
+    fn bytes_for(&self, mime: &str) -> std::borrow::Cow<'_, [u8]> {
+        match self {
+            Payload::Uris(body) if !mime.eq_ignore_ascii_case(URI_LIST_MIME) => {
+                std::borrow::Cow::Owned(parse_uris(body).join("\n").into_bytes())
+            }
+            _ => std::borrow::Cow::Borrowed(self.bytes()),
         }
     }
 
@@ -486,7 +504,13 @@ fn read_offer_payload(
                 .ok();
             let dims = decoded.as_ref().map(|img| (img.width(), img.height()));
             let thumb = decoded.map(|img| {
-                let small = img.thumbnail(THUMB_MAX_W, THUMB_MAX_H).to_rgba8();
+                // thumbnail() would upscale sources smaller than the box;
+                // small images pass through at native size instead.
+                let small = if img.width() <= THUMB_MAX_W && img.height() <= THUMB_MAX_H {
+                    img.to_rgba8()
+                } else {
+                    img.thumbnail(THUMB_MAX_W, THUMB_MAX_H).to_rgba8()
+                };
                 let (width, height) = (small.width(), small.height());
                 Thumbnail {
                     width,
@@ -556,7 +580,10 @@ fn read_bounded(fd: rustix::fd::OwnedFd, cap: usize) -> Option<(Vec<u8>, bool)> 
             Ok(0) => return Some((buf, false)),
             Ok(n) => {
                 buf.extend_from_slice(&chunk[..n]);
-                if buf.len() >= cap {
+                // Strictly-greater: a payload of exactly `cap` bytes is
+                // complete, not truncated — keep reading until we see either
+                // EOF or a byte beyond the cap.
+                if buf.len() > cap {
                     buf.truncate(cap);
                     return Some((buf, true));
                 }
@@ -908,7 +935,7 @@ impl Dispatch<ExtDataControlSourceV1, ()> for WatchState {
     ) {
         use ext_data_control_source_v1::Event;
         match event {
-            Event::Send { mime_type: _, fd } => {
+            Event::Send { mime_type, fd } => {
                 // Serve only for the live source; a Send racing its own
                 // cancellation gets nothing (receiver sees EOF).
                 if let Some(own) = state
@@ -916,7 +943,7 @@ impl Dispatch<ExtDataControlSourceV1, ()> for WatchState {
                     .as_ref()
                     .filter(|own| own.source == *source)
                 {
-                    write_bounded(fd, own.payload.bytes());
+                    write_bounded(fd, &own.payload.bytes_for(&mime_type));
                 }
             }
             Event::Cancelled => {
@@ -1320,6 +1347,45 @@ mod tests {
         // Payload equality is (mime, bytes) — thumbnails/dims are derived.
         assert_eq!(read_back(&mut state, &mut queue, &conn), image_payload);
         drop(handle);
+    }
+
+    #[test]
+    fn exact_cap_payload_is_complete_not_truncated() {
+        fn read_pipe(data: &[u8], cap: usize) -> Option<(Vec<u8>, bool)> {
+            let (read_fd, write_fd) =
+                rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).unwrap();
+            let data = data.to_vec();
+            let writer = std::thread::spawn(move || {
+                let mut file = std::fs::File::from(write_fd);
+                let _ = file.write_all(&data);
+            });
+            let result = read_bounded(read_fd, cap);
+            writer.join().unwrap();
+            result
+        }
+
+        let (bytes, truncated) = read_pipe(&[7u8; 1000], 1000).unwrap();
+        assert_eq!((bytes.len(), truncated), (1000, false), "exact cap is complete");
+        let (bytes, truncated) = read_pipe(&[7u8; 1001], 1000).unwrap();
+        assert_eq!((bytes.len(), truncated), (1000, true), "over cap truncates");
+        let (bytes, truncated) = read_pipe(&[7u8; 500], 1000).unwrap();
+        assert_eq!((bytes.len(), truncated), (500, false));
+    }
+
+    #[test]
+    fn uri_restores_serve_clean_text_for_plain_mimes() {
+        let payload = Payload::Uris("file:///a/b.png\r\nfile:///c/d.txt\r\n".into());
+        assert_eq!(
+            payload.bytes_for("text/plain").as_ref(),
+            b"file:///a/b.png\nfile:///c/d.txt"
+        );
+        assert_eq!(
+            payload.bytes_for("text/uri-list").as_ref(),
+            b"file:///a/b.png\r\nfile:///c/d.txt\r\n",
+            "uri-list receivers get the verbatim body"
+        );
+        // Non-uri payloads serve identically for every mime.
+        assert_eq!(txt("hi").bytes_for("text/plain").as_ref(), b"hi");
     }
 
     #[test]

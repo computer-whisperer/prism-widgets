@@ -417,7 +417,14 @@ fn list_headline(count: usize) -> String {
 /// with a hover fill; keyless entries render inert.
 fn list_entry_row(panel_id: &str, module_id: &str, entry: &ListEntry, cx: &BuildCx) -> El {
     let mut cells = Vec::new();
-    if let Some(thumb) = &entry.thumbnail {
+    // The length check guards damascene's `from_rgba8` assert: a malformed
+    // thumbnail from a buggy provider degrades to a text-only row instead
+    // of panicking the render thread.
+    if let Some(thumb) = entry
+        .thumbnail
+        .as_ref()
+        .filter(|t| t.rgba.len() == (t.width * t.height * 4) as usize)
+    {
         // Provider-downscaled RGBA8; damascene content-hashes it into the
         // texture cache, so rebuilding the Image each frame is cheap.
         cells.push(
