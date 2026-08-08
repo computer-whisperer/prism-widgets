@@ -90,7 +90,8 @@ panel "top-right-usage" {
 //         gpu card=0 interval=3
 //         gpu card=1 interval=3
 //         // Rolling clipboard history observed via ext-data-control:
-//         // newest first, text selections only. Selections flagged with
+//         // newest first; text, file lists, and images (with thumbnails).
+//         // Click an entry to copy it again. Selections flagged with
 //         // x-kde-passwordManagerHint (password managers) are never stored.
 //         clipboard max-entries=8
 //     }

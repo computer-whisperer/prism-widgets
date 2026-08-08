@@ -47,10 +47,16 @@ own Wayland connection (never the host's — the provider seam stays one-way),
 registers as an ext-data-control clipboard manager, and pushes a snapshot when
 the selection changes instead of on a timer. It idles in a 500ms-timeout poll
 on the connection fd, which is also how it notices shutdown. Selections
-offering `x-kde-passwordManagerHint` are never read; only text mimes are
-recorded, truncated at 128 KiB. `examples/clipboard-tool.rs` exercises the
-same protocol from the other side (get/set/clear) for end-to-end testing
-without wl-clipboard.
+offering `x-kde-passwordManagerHint` are never read. Recorded payloads, by
+mime preference: file lists (`text/uri-list`, so restores paste files), text
+(truncated at 128 KiB), and images (png/jpeg/webp/bmp; oversized ones are
+dropped whole at 16 MiB — truncated image bytes are garbage — and decoding
+runs under explicit dimension/alloc limits since the bytes come from
+arbitrary apps). Image entries carry a provider-downscaled RGBA thumbnail in
+the snapshot while the full encoded bytes stay watcher-side for restore,
+under a 64 MiB rolling budget that evicts oldest image entries first.
+`examples/clipboard-tool.rs` exercises the same protocol from the other side
+(get/set/set-image/clear) for end-to-end testing without wl-clipboard.
 
 ## Input and Actions
 

@@ -14,6 +14,7 @@ authors = ["Christian Balcom"]
 anyhow = "1"
 base64 = "0.23"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "bmp"] }
 damascene-core = "0.7.0"
 damascene-wgpu = "0.7.0"
 knuffel = "3.2.0"

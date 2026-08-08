@@ -379,7 +379,35 @@ pub struct ListEntry {
     /// Trailing annotation when the label alone under-describes the entry
     /// (e.g. `"12 lines"` for a multi-line clipboard payload).
     pub meta: Option<String>,
+    /// Small raster preview (image clipboard entries). The provider owns
+    /// decode and downscale; the UI just displays it.
+    pub thumbnail: Option<Thumbnail>,
 }
+
+/// A decoded, provider-downscaled RGBA8 preview. Kept codec-free so this
+/// contract crate needs no image dependencies.
+///
+/// Equality is *identity* (shared allocation), not pixel content: two
+/// thumbnails are display-equal iff they came from the same provider push,
+/// which is what snapshot redraw suppression needs — and it keeps
+/// `display_eq` O(1) instead of comparing pixel buffers.
+#[derive(Clone, Debug)]
+pub struct Thumbnail {
+    pub width: u32,
+    /// Row-major RGBA8; `rgba.len() == width * height * 4`.
+    pub height: u32,
+    pub rgba: std::sync::Arc<[u8]>,
+}
+
+impl PartialEq for Thumbnail {
+    fn eq(&self, other: &Self) -> bool {
+        self.width == other.width
+            && self.height == other.height
+            && std::sync::Arc::ptr_eq(&self.rgba, &other.rgba)
+    }
+}
+
+impl Eq for Thumbnail {}
 
 /// A UI-originated action routed back to the provider generation — the
 /// reverse direction of [`ModuleUpdate`]. The host forwards these opaquely

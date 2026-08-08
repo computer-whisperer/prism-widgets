@@ -3,9 +3,10 @@
 //! watcher consumes, so it also validates the compositor's server side.
 //!
 //! Usage:
-//!   clipboard-tool get          # print the current text selection
-//!   clipboard-tool set <text>   # own the selection until replaced/killed
-//!   clipboard-tool clear        # clear the selection
+//!   clipboard-tool get               # print the current text selection
+//!   clipboard-tool set <text>        # own the selection until replaced/killed
+//!   clipboard-tool set-image <path>  # own the selection with an image file
+//!   clipboard-tool clear             # clear the selection
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -61,11 +62,28 @@ fn main() {
             print!("{text}");
         }
         "set" => {
-            state.payload = args.next().expect("set needs a payload argument");
+            state.payload = args.next().expect("set needs a payload argument").into_bytes();
             let source = manager.create_data_source(&qh, ());
             source.offer(TEXT_MIME.to_string());
             source.offer("text/plain".to_string());
             source.offer("UTF8_STRING".to_string());
+            device.set_selection(Some(&source));
+            while !state.cancelled {
+                queue.blocking_dispatch(&mut state).expect("dispatch");
+            }
+        }
+        "set-image" => {
+            let path = args.next().expect("set-image needs a file path");
+            state.payload = std::fs::read(&path).expect("read image file");
+            let mime = match path.rsplit('.').next().unwrap_or("").to_ascii_lowercase().as_str() {
+                "png" => "image/png",
+                "jpg" | "jpeg" => "image/jpeg",
+                "webp" => "image/webp",
+                "bmp" => "image/bmp",
+                other => panic!("unsupported image extension {other:?}"),
+            };
+            let source = manager.create_data_source(&qh, ());
+            source.offer(mime.to_string());
             device.set_selection(Some(&source));
             while !state.cancelled {
                 queue.blocking_dispatch(&mut state).expect("dispatch");
@@ -86,7 +104,7 @@ fn main() {
 struct ToolState {
     offers: HashMap<ObjectId, Vec<String>>,
     selection: Option<ExtDataControlOfferV1>,
-    payload: String,
+    payload: Vec<u8>,
     cancelled: bool,
 }
 
@@ -177,7 +195,7 @@ impl Dispatch<ExtDataControlSourceV1, ()> for ToolState {
         use ext_data_control_source_v1::Event;
         match event {
             Event::Send { mime_type: _, fd } => {
-                let _ = std::fs::File::from(fd).write_all(state.payload.as_bytes());
+                let _ = std::fs::File::from(fd).write_all(&state.payload);
             }
             Event::Cancelled => state.cancelled = true,
             _ => {}

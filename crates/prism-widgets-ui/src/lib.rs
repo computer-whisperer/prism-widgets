@@ -416,10 +416,29 @@ fn list_headline(count: usize) -> String {
 /// pinned to the right edge. Entries carrying a key become hit targets
 /// with a hover fill; keyless entries render inert.
 fn list_entry_row(panel_id: &str, module_id: &str, entry: &ListEntry, cx: &BuildCx) -> El {
-    let mut cells = vec![text(ellipsize(&entry.label, 48))
-        .caption()
-        .ellipsis()
-        .width(Size::Fill(1.0))];
+    let mut cells = Vec::new();
+    if let Some(thumb) = &entry.thumbnail {
+        // Provider-downscaled RGBA8; damascene content-hashes it into the
+        // texture cache, so rebuilding the Image each frame is cheap.
+        cells.push(
+            image(Image::from_rgba8(
+                thumb.width,
+                thumb.height,
+                thumb.rgba.to_vec(),
+            ))
+            .image_fit(ImageFit::Cover)
+            .width(Size::Fixed(56.0))
+            .height(Size::Fixed(40.0))
+            .radius(4.0)
+            .clip(),
+        );
+    }
+    cells.push(
+        text(ellipsize(&entry.label, 48))
+            .caption()
+            .ellipsis()
+            .width(Size::Fill(1.0)),
+    );
     if let Some(meta) = &entry.meta {
         cells.push(text(ellipsize(meta, 14)).caption().muted());
     }
@@ -785,11 +804,13 @@ mod tests {
                         key: Some("7".into()),
                         label: "hello".into(),
                         meta: None,
+                        thumbnail: None,
                     },
                     ListEntry {
                         key: None,
                         label: "inert".into(),
                         meta: None,
+                        thumbnail: None,
                     },
                 ],
             }),
