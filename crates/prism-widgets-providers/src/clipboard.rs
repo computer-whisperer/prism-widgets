@@ -20,7 +20,7 @@ use prism_widgets_core::{
 };
 use prism_widgets_host::SnapshotSender;
 use rustix::event::{PollFd, PollFlags, Timespec};
-use wayland_client::backend::ObjectId;
+use wayland_client::backend::{ObjectId, WaylandError};
 use wayland_client::globals::{registry_queue_init, GlobalListContents};
 use wayland_client::protocol::{wl_registry, wl_seat};
 use wayland_client::{event_created_child, Connection, Dispatch, Proxy, QueueHandle};
@@ -137,7 +137,12 @@ fn run_watch(
             return Ok(());
         }
 
-        queue.flush().context("flushing connection")?;
+        match queue.flush() {
+            Ok(()) => {}
+            // Send buffer full; the pending requests go out on a later tick.
+            Err(WaylandError::Io(err)) if err.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(err) => return Err(err).context("flushing connection"),
+        }
         let Some(guard) = queue.prepare_read() else {
             continue; // events already queued; dispatch them first
         };
@@ -145,9 +150,13 @@ fn run_watch(
         let mut fds = [PollFd::from_borrowed_fd(fd, PollFlags::IN)];
         match rustix::event::poll(&mut fds, Some(&SHUTDOWN_POLL)) {
             Ok(0) => drop(guard), // idle tick: loop around for the shutdown check
-            Ok(_) => {
-                guard.read().context("reading connection")?;
-            }
+            Ok(_) => match guard.read() {
+                Ok(_) => {}
+                // Spurious wakeup: with the rs backend an empty socket reads
+                // as WouldBlock rather than 0 events; not fatal.
+                Err(WaylandError::Io(err)) if err.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(err) => return Err(err).context("reading connection"),
+            },
             Err(rustix::io::Errno::INTR) => drop(guard),
             Err(err) => return Err(err).context("polling connection"),
         }
