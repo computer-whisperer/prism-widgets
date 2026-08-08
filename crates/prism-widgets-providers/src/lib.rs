@@ -17,8 +17,8 @@ use std::time::{Duration, Instant, SystemTime};
 use base64::Engine;
 use prism_widgets_core::{
     clock_snapshot, CommandSpec, CpuSpec, Gauge, GaugeGroup, GitHubSpec, GitLabSpec, GpuSpec,
-    MemorySpec, ModuleSnapshot, ModuleSpec, ModuleStatus, ModuleUpdate, ModuleValue, PanelId,
-    PanelSnapshot, PanelSpec, StatusPageSpec, UsageSpec,
+    MemorySpec, ModuleAction, ModuleActionKind, ModuleSnapshot, ModuleSpec, ModuleStatus,
+    ModuleUpdate, ModuleValue, PanelId, PanelSnapshot, PanelSpec, StatusPageSpec, UsageSpec,
 };
 use prism_widgets_host::{collapse_snapshot, PanelDataSource, ProviderHandle, SnapshotSender};
 use serde_json::Value;
@@ -118,9 +118,41 @@ impl PanelDataSource for SnapshotStore {
 pub struct SchedulerHandle {
     shutdown: Arc<AtomicBool>,
     workers: Vec<JoinHandle<()>>,
+    /// Per-module action channels for the event-driven workers (clipboard),
+    /// looked up by (panel, module) when the host forwards a UI action.
+    action_routes: Vec<ActionRoute>,
 }
 
-impl ProviderHandle for SchedulerHandle {}
+struct ActionRoute {
+    panel: PanelId,
+    module: String,
+    sender: std::sync::mpsc::Sender<ModuleActionKind>,
+    /// Write end of the worker's wake pipe: one byte per action interrupts
+    /// its poll so it drains the channel immediately instead of on the next
+    /// 500ms tick. Non-blocking — a full pipe already guarantees a wakeup.
+    wake: std::fs::File,
+}
+
+impl ProviderHandle for SchedulerHandle {
+    fn dispatch(&self, action: ModuleAction) {
+        use std::io::Write as _;
+        let Some(route) = self
+            .action_routes
+            .iter()
+            .find(|route| route.panel == action.panel && route.module == action.module)
+        else {
+            tracing::debug!(
+                panel = %action.panel.0,
+                module = %action.module,
+                "dropping action for module without a route"
+            );
+            return;
+        };
+        if route.sender.send(action.kind).is_ok() {
+            let _ = (&route.wake).write(&[1]);
+        }
+    }
+}
 
 impl Drop for SchedulerHandle {
     fn drop(&mut self) {
@@ -140,6 +172,7 @@ impl Drop for SchedulerHandle {
 pub fn start_scheduler(specs: &[PanelSpec], sender: SnapshotSender, epoch: u64) -> SchedulerHandle {
     let shutdown = Arc::new(AtomicBool::new(false));
     let mut workers = Vec::new();
+    let mut action_routes = Vec::new();
     for panel in specs {
         for module in &panel.modules {
             match module {
@@ -149,9 +182,24 @@ pub fn start_scheduler(specs: &[PanelSpec], sender: SnapshotSender, epoch: u64) 
                     let module_id = module.id().to_string();
                     let sender = sender.clone();
                     let shutdown = Arc::clone(&shutdown);
+                    let (action_tx, action_rx) = std::sync::mpsc::channel();
+                    let (wake_rx, wake_tx) = rustix::pipe::pipe_with(
+                        rustix::pipe::PipeFlags::CLOEXEC | rustix::pipe::PipeFlags::NONBLOCK,
+                    )
+                    .expect("wake pipe");
+                    action_routes.push(ActionRoute {
+                        panel: panel_id.clone(),
+                        module: module_id.clone(),
+                        sender: action_tx,
+                        wake: std::fs::File::from(wake_tx),
+                    });
+                    let inbox = clipboard::ActionInbox {
+                        actions: action_rx,
+                        wake: wake_rx,
+                    };
                     workers.push(thread::spawn(move || {
                         clipboard::watch_clipboard(
-                            &spec, panel_id, module_id, epoch, &sender, &shutdown,
+                            &spec, panel_id, module_id, epoch, &sender, &shutdown, inbox,
                         );
                     }));
                 }
@@ -173,7 +221,11 @@ pub fn start_scheduler(specs: &[PanelSpec], sender: SnapshotSender, epoch: u64) 
             }
         }
     }
-    SchedulerHandle { shutdown, workers }
+    SchedulerHandle {
+        shutdown,
+        workers,
+        action_routes,
+    }
 }
 
 fn poll_module(

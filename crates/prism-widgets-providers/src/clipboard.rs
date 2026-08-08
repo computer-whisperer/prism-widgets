@@ -8,15 +8,16 @@
 //! never read at all.
 
 use std::collections::{HashMap, VecDeque};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::os::fd::AsFd as _;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context as _, Result};
 use prism_widgets_core::{
-    ClipboardSpec, ListEntry, ListGroup, ModuleSnapshot, ModuleStatus, ModuleUpdate, ModuleValue,
-    PanelId,
+    ClipboardSpec, ListEntry, ListGroup, ModuleActionKind, ModuleSnapshot, ModuleStatus,
+    ModuleUpdate, ModuleValue, PanelId,
 };
 use prism_widgets_host::SnapshotSender;
 use rustix::event::{PollFd, PollFlags, Timespec};
@@ -28,6 +29,7 @@ use wayland_protocols::ext::data_control::v1::client::{
     ext_data_control_device_v1::{self, ExtDataControlDeviceV1},
     ext_data_control_manager_v1::ExtDataControlManagerV1,
     ext_data_control_offer_v1::{self, ExtDataControlOfferV1},
+    ext_data_control_source_v1::{self, ExtDataControlSourceV1},
 };
 
 /// How often the watch loop wakes to check the shutdown flag while idle.
@@ -56,9 +58,27 @@ const TEXT_MIMES: &[&str] = &[
     "text",
 ];
 
+/// Mimes offered when this provider re-owns the selection for a restored
+/// history entry.
+const OFFER_MIMES: &[&str] = &[
+    "text/plain;charset=utf-8",
+    "text/plain",
+    "UTF8_STRING",
+    "STRING",
+    "TEXT",
+];
+
 /// Worker entry point: watch until shutdown, pushing a snapshot on every
 /// history change. Setup or protocol failures surface as a warning snapshot
 /// so the panel shows why there's no history rather than a stuck spinner.
+/// The receiving half of a module's action route: the channel the host's
+/// `ProviderHandle::dispatch` feeds, plus the pipe end whose readability
+/// interrupts the watcher's poll.
+pub(crate) struct ActionInbox {
+    pub(crate) actions: mpsc::Receiver<ModuleActionKind>,
+    pub(crate) wake: rustix::fd::OwnedFd,
+}
+
 pub(crate) fn watch_clipboard(
     spec: &ClipboardSpec,
     panel: PanelId,
@@ -66,8 +86,9 @@ pub(crate) fn watch_clipboard(
     epoch: u64,
     sender: &SnapshotSender,
     shutdown: &AtomicBool,
+    inbox: ActionInbox,
 ) {
-    if let Err(err) = run_watch(spec, &panel, &module, epoch, sender, shutdown) {
+    if let Err(err) = run_watch(spec, &panel, &module, epoch, sender, shutdown, inbox) {
         tracing::warn!("clipboard watcher stopped: {err:#}");
         let snapshot = ModuleSnapshot {
             id: spec.id.clone(),
@@ -96,6 +117,7 @@ fn run_watch(
     epoch: u64,
     sender: &SnapshotSender,
     shutdown: &AtomicBool,
+    inbox: ActionInbox,
 ) -> Result<()> {
     let conn = Connection::connect_to_env().context("connecting to Wayland display")?;
     let (globals, mut queue) =
@@ -106,7 +128,7 @@ fn run_watch(
         .bind(&qh, 1..=1, ())
         .context("binding ext_data_control_manager_v1 (compositor lacks ext-data-control-v1)")?;
     let seat: wl_seat::WlSeat = globals.bind(&qh, 1..=1, ()).context("binding wl_seat")?;
-    let _device = manager.get_data_device(&seat, &qh, ());
+    let device = manager.get_data_device(&seat, &qh, ());
 
     let mut state = WatchState::default();
     let mut history = ClipboardHistory::new(spec.max_entries);
@@ -120,6 +142,8 @@ fn run_watch(
         return Ok(());
     }
 
+    let actions = inbox.actions;
+    let wake = std::fs::File::from(inbox.wake);
     loop {
         queue
             .dispatch_pending(&mut state)
@@ -136,6 +160,11 @@ fn run_watch(
         if shutdown.load(Ordering::Acquire) {
             return Ok(());
         }
+        // Drain UI actions before flushing so their requests (set_selection)
+        // ride this iteration's flush.
+        while let Ok(kind) = actions.try_recv() {
+            handle_action(&mut state, &qh, &manager, &device, &history, kind);
+        }
 
         match queue.flush() {
             Ok(()) => {}
@@ -146,19 +175,87 @@ fn run_watch(
         let Some(guard) = queue.prepare_read() else {
             continue; // events already queued; dispatch them first
         };
-        let fd = guard.connection_fd();
-        let mut fds = [PollFd::from_borrowed_fd(fd, PollFlags::IN)];
+        let conn_fd = guard.connection_fd();
+        let mut fds = [
+            PollFd::from_borrowed_fd(conn_fd, PollFlags::IN),
+            PollFd::new(&wake, PollFlags::IN),
+        ];
         match rustix::event::poll(&mut fds, Some(&SHUTDOWN_POLL)) {
             Ok(0) => drop(guard), // idle tick: loop around for the shutdown check
-            Ok(_) => match guard.read() {
-                Ok(_) => {}
-                // Spurious wakeup: with the rs backend an empty socket reads
-                // as WouldBlock rather than 0 events; not fatal.
-                Err(WaylandError::Io(err)) if err.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(err) => return Err(err).context("reading connection"),
-            },
+            Ok(_) => {
+                let conn_ready = !fds[0].revents().is_empty();
+                let wake_ready = !fds[1].revents().is_empty();
+                if conn_ready {
+                    match guard.read() {
+                        Ok(_) => {}
+                        // Spurious wakeup: with the rs backend an empty socket
+                        // reads as WouldBlock rather than 0 events; not fatal.
+                        Err(WaylandError::Io(err))
+                            if err.kind() == std::io::ErrorKind::WouldBlock => {}
+                        Err(err) => return Err(err).context("reading connection"),
+                    }
+                } else {
+                    drop(guard);
+                }
+                if wake_ready {
+                    drain_wake(&wake);
+                    // The queued actions themselves are drained at loop top.
+                }
+            }
             Err(rustix::io::Errno::INTR) => drop(guard),
             Err(err) => return Err(err).context("polling connection"),
+        }
+    }
+}
+
+/// Perform a UI-originated action. Restores re-own the selection with the
+/// entry's text via a fresh data-control source; the compositor then echoes
+/// a `selection` event back to our device, which is where the history
+/// promotion and snapshot push happen (single source of truth).
+fn handle_action(
+    state: &mut WatchState,
+    qh: &QueueHandle<WatchState>,
+    manager: &ExtDataControlManagerV1,
+    device: &ExtDataControlDeviceV1,
+    history: &ClipboardHistory,
+    kind: ModuleActionKind,
+) {
+    match kind {
+        ModuleActionKind::ClipboardRestore { entry } => {
+            let Ok(key) = entry.parse::<u64>() else {
+                tracing::warn!("malformed clipboard entry key {entry:?}");
+                return;
+            };
+            let Some(text) = history.text_of(key) else {
+                return; // entry evicted between render and click
+            };
+            let source = manager.create_data_source(qh, ());
+            for mime in OFFER_MIMES {
+                source.offer((*mime).to_string());
+            }
+            device.set_selection(Some(&source));
+            // A previously owned source is now stale; the compositor sends
+            // it `cancelled`, and that handler destroys it.
+            state.own = Some(OwnSelection {
+                source,
+                text,
+                entry: key,
+            });
+        }
+    }
+}
+
+/// Empty the wake pipe after its poll fired; the actual actions travel on
+/// the mpsc channel, the pipe only interrupts the poll.
+fn drain_wake(wake: &std::fs::File) {
+    let mut buf = [0u8; 64];
+    loop {
+        match (&*wake).read(&mut buf) {
+            Ok(0) => return,
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => return,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return,
         }
     }
 }
@@ -176,6 +273,17 @@ fn absorb_selection(
         return false; // selection cleared; history keeps its entries
     };
     let mimes = state.offers.remove(&offer.id()).unwrap_or_default();
+    if let Some(own) = &state.own {
+        // The selection event echoes our own set_selection (a restore).
+        // Receiving from ourselves would deadlock — the pipe only fills
+        // when we dispatch our own Send event — and we already know the
+        // text; promote the restored entry instead. A foreign copy racing
+        // this is resolved by ordering: the compositor cancels our source
+        // before announcing the foreign selection, and `Cancelled` clears
+        // `own` earlier in the same dispatch batch.
+        offer.destroy();
+        return history.promote(own.entry);
+    }
     let text = read_offer_text(conn, &offer, &mimes);
     offer.destroy();
     match text {
@@ -290,16 +398,25 @@ fn send_history(
 }
 
 /// Rolling most-recent-first history with de-duplication: re-copying an old
-/// entry moves it back to the front instead of duplicating it.
+/// entry moves it back to the front instead of duplicating it. Each entry
+/// carries a stable numeric key — kept across promotions — that the UI
+/// echoes back in restore actions.
 pub(crate) struct ClipboardHistory {
     cap: usize,
-    entries: VecDeque<String>,
+    next_key: u64,
+    entries: VecDeque<HistoryEntry>,
+}
+
+struct HistoryEntry {
+    key: u64,
+    text: String,
 }
 
 impl ClipboardHistory {
     pub(crate) fn new(cap: usize) -> Self {
         Self {
             cap,
+            next_key: 0,
             entries: VecDeque::new(),
         }
     }
@@ -309,25 +426,60 @@ impl ClipboardHistory {
         if text.trim().is_empty() {
             return false;
         }
-        if self.entries.front() == Some(&text) {
+        if self.entries.front().is_some_and(|front| front.text == text) {
             return false;
         }
-        self.entries.retain(|entry| entry != &text);
-        self.entries.push_front(text);
+        // A re-copy of an existing entry keeps its key (promotion, not a
+        // new entry); genuinely new text gets a fresh one.
+        let key = match self.entries.iter().position(|entry| entry.text == text) {
+            Some(i) => self.entries.remove(i).expect("indexed entry").key,
+            None => {
+                let key = self.next_key;
+                self.next_key += 1;
+                key
+            }
+        };
+        self.entries.push_front(HistoryEntry { key, text });
         self.entries.truncate(self.cap);
         tracing::debug!(entries = self.entries.len(), "clipboard history updated");
         true
     }
 
+    /// Move the entry with the given key to the front (a restore landed).
+    /// Returns whether the visible history changed.
+    pub(crate) fn promote(&mut self, key: u64) -> bool {
+        match self.entries.iter().position(|entry| entry.key == key) {
+            Some(0) => false,
+            Some(i) => {
+                let entry = self.entries.remove(i).expect("indexed entry");
+                self.entries.push_front(entry);
+                true
+            }
+            None => false, // evicted since the click
+        }
+    }
+
+    pub(crate) fn text_of(&self, key: u64) -> Option<String> {
+        self.entries
+            .iter()
+            .find(|entry| entry.key == key)
+            .map(|entry| entry.text.clone())
+    }
+
     pub(crate) fn list(&self) -> ListGroup {
         ListGroup {
-            entries: self.entries.iter().map(|text| list_entry(text)).collect(),
+            entries: self
+                .entries
+                .iter()
+                .map(|entry| list_entry(entry.key, &entry.text))
+                .collect(),
         }
     }
 }
 
-fn list_entry(text: &str) -> ListEntry {
+fn list_entry(key: u64, text: &str) -> ListEntry {
     ListEntry {
+        key: Some(key.to_string()),
         label: entry_label(text),
         meta: entry_meta(text),
     }
@@ -361,8 +513,20 @@ struct WatchState {
     /// event dispatch so the (blocking, bounded) pipe read never runs inside
     /// a handler.
     selection_dirty: bool,
+    /// Live while this provider owns the selection (a restored entry being
+    /// served to other clients). Cleared by the source's `cancelled` event
+    /// when someone else copies.
+    own: Option<OwnSelection>,
     /// The compositor invalidated the device (seat gone).
     finished: bool,
+}
+
+struct OwnSelection {
+    source: ExtDataControlSourceV1,
+    text: String,
+    /// History key of the entry being served, promoted when the
+    /// compositor echoes the selection back.
+    entry: u64,
 }
 
 impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for WatchState {
@@ -461,6 +625,78 @@ impl Dispatch<ExtDataControlOfferV1, ()> for WatchState {
     }
 }
 
+impl Dispatch<ExtDataControlSourceV1, ()> for WatchState {
+    fn event(
+        state: &mut Self,
+        source: &ExtDataControlSourceV1,
+        event: ext_data_control_source_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        use ext_data_control_source_v1::Event;
+        match event {
+            Event::Send { mime_type: _, fd } => {
+                // Serve only for the live source; a Send racing its own
+                // cancellation gets nothing (receiver sees EOF).
+                if let Some(own) = state
+                    .own
+                    .as_ref()
+                    .filter(|own| own.source == *source)
+                {
+                    write_bounded(fd, own.text.as_bytes());
+                }
+            }
+            Event::Cancelled => {
+                if state
+                    .own
+                    .as_ref()
+                    .is_some_and(|own| own.source == *source)
+                {
+                    state.own = None;
+                }
+                source.destroy();
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Write a restored payload to a receiver's pipe, bounded by the same
+/// deadline as reads: a receiver that never drains its pipe costs us at
+/// most `RECEIVE_TIMEOUT`, then sees a short payload.
+fn write_bounded(fd: rustix::fd::OwnedFd, bytes: &[u8]) {
+    let mut file = std::fs::File::from(fd);
+    let deadline = Instant::now() + RECEIVE_TIMEOUT;
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return;
+        };
+        let timeout = Timespec {
+            tv_sec: remaining.as_secs() as i64,
+            tv_nsec: remaining.subsec_nanos() as i64,
+        };
+        let mut fds = [PollFd::new(&file, PollFlags::OUT)];
+        match rustix::event::poll(&mut fds, Some(&timeout)) {
+            Ok(0) => return, // receiver stalled
+            Ok(_) => {}
+            Err(rustix::io::Errno::INTR) => continue,
+            Err(_) => return,
+        }
+        match file.write(&bytes[offset..]) {
+            Ok(0) => return,
+            Ok(n) => offset += n,
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+                ) => {}
+            Err(_) => return, // receiver closed (EPIPE) or similar
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -503,20 +739,174 @@ mod tests {
 
     #[test]
     fn multiline_entries_show_head_line_and_count() {
-        let entry = list_entry("\n  fn main() {\n    body\n}\n");
+        let entry = list_entry(0, "\n  fn main() {\n    body\n}\n");
         assert_eq!(entry.label, "fn main() {");
         assert_eq!(entry.meta.as_deref(), Some("4 lines"));
 
-        let short = list_entry("hello");
+        let short = list_entry(1, "hello");
         assert_eq!(short.label, "hello");
         assert_eq!(short.meta, None);
+        assert_eq!(short.key.as_deref(), Some("1"));
     }
 
     #[test]
     fn large_single_line_entries_carry_a_size_annotation() {
         let big = "x".repeat(10 * 1024);
-        let entry = list_entry(&big);
+        let entry = list_entry(0, &big);
         assert_eq!(entry.meta.as_deref(), Some("10 KB"));
+    }
+
+    #[test]
+    fn entry_keys_are_stable_across_promotion_and_lookup() {
+        let mut history = ClipboardHistory::new(3);
+        history.push("alpha".into());
+        history.push("beta".into());
+        let alpha_key: u64 = history.list().entries[1]
+            .key
+            .as_deref()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(history.text_of(alpha_key).as_deref(), Some("alpha"));
+
+        // Re-copying keeps the key; promoting moves without renaming.
+        assert!(history.push("alpha".into()));
+        assert_eq!(
+            history.list().entries[0].key.as_deref(),
+            Some(alpha_key.to_string().as_str())
+        );
+        assert!(!history.promote(alpha_key), "already at front");
+        history.push("gamma".into());
+        assert!(history.promote(alpha_key));
+        assert_eq!(history.list().entries[0].label, "alpha");
+
+        // Unknown / evicted keys are inert.
+        assert!(!history.promote(9999));
+        assert_eq!(history.text_of(9999), None);
+    }
+
+    /// Full action loop against the live compositor: a tool-side connection
+    /// seeds the selection, the scheduler's watcher records it, a dispatched
+    /// restore makes the watcher re-own the selection, and the tool side
+    /// reads it back. Needs a Wayland session with ext-data-control; run
+    /// explicitly with `cargo test -p prism-widgets-providers -- --ignored`.
+    ///
+    /// WARNING: running this REPLACES the session's clipboard selection with
+    /// a test payload (and leaves it cleared when the test process exits).
+    #[test]
+    #[ignore = "needs a live Wayland session with ext-data-control"]
+    fn restore_reowns_selection_live() {
+        use prism_widgets_core::{
+            ModuleAction, ModuleSpec, PanelAnchor, PanelAppearance, PanelGeometry, PanelLayer,
+            PanelLayout, PanelSpec, ThemeName,
+        };
+        use prism_widgets_host::ProviderHandle as _;
+
+        // Tool-side connection: seeds the clipboard, then reads it back.
+        let conn = Connection::connect_to_env().expect("wayland session");
+        let (globals, mut queue) = registry_queue_init::<WatchState>(&conn).expect("registry");
+        let qh = queue.handle();
+        let manager: ExtDataControlManagerV1 =
+            globals.bind(&qh, 1..=1, ()).expect("ext-data-control");
+        let seat: wl_seat::WlSeat = globals.bind(&qh, 1..=1, ()).expect("wl_seat");
+        let _device = manager.get_data_device(&seat, &qh, ());
+        let mut state = WatchState::default();
+        queue.roundtrip(&mut state).expect("initial roundtrip");
+
+        // Seed a unique payload, served by WatchState's own source dispatch.
+        let payload = format!("clipboard-live-test-{}", std::process::id());
+        let source = manager.create_data_source(&qh, ());
+        for mime in OFFER_MIMES {
+            source.offer((*mime).to_string());
+        }
+        _device.set_selection(Some(&source));
+        state.own = Some(OwnSelection {
+            source,
+            text: payload.clone(),
+            entry: 0,
+        });
+        queue.flush().expect("flush seed");
+
+        let (sender, snapshots) = prism_widgets_host::snapshot_channel();
+        let panel = PanelId::new("live-test");
+        let spec = PanelSpec {
+            id: panel.clone(),
+            output: None,
+            layout: PanelLayout::Sidebar,
+            geometry: PanelGeometry {
+                width: Some(300),
+                height: 100,
+                margin: 0,
+                exclusive_zone: -1,
+                anchor: PanelAnchor::Right,
+                layer: PanelLayer::Top,
+            },
+            appearance: PanelAppearance {
+                opacity: 1.0,
+                radius: 0.0,
+                border: false,
+                show_header: false,
+                theme: ThemeName::Dark,
+            },
+            modules: vec![ModuleSpec::Clipboard(ClipboardSpec {
+                id: "clipboard".into(),
+                max_entries: 4,
+            })],
+        };
+        let handle = crate::start_scheduler(&[spec], sender, 1);
+
+        // Wait for the watcher to record our payload, serving its receive
+        // (our Send event) via roundtrips meanwhile.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let entry_key = 'found: loop {
+            assert!(
+                Instant::now() < deadline,
+                "watcher never recorded the seeded payload"
+            );
+            queue.roundtrip(&mut state).expect("roundtrip while waiting");
+            while let Ok(update) = snapshots.try_recv() {
+                if let ModuleValue::List(group) = &update.snapshot.value {
+                    if let Some(entry) =
+                        group.entries.iter().find(|entry| entry.label == payload)
+                    {
+                        break 'found entry.key.clone().expect("entry key");
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+
+        // Restore through the host-facing seam.
+        handle.dispatch(ModuleAction {
+            panel,
+            module: "clipboard".into(),
+            kind: ModuleActionKind::ClipboardRestore { entry: entry_key },
+        });
+
+        // The watcher re-owns the selection: our seed source gets cancelled
+        // (clearing `state.own`), a fresh offer arrives, and reading it back
+        // must yield the payload — served by the watcher thread.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let text = loop {
+            assert!(
+                Instant::now() < deadline,
+                "watcher never re-owned the selection"
+            );
+            queue.roundtrip(&mut state).expect("roundtrip after restore");
+            if state.own.is_none() {
+                if let Some(offer) = state.clipboard_offer.take() {
+                    let mimes = state.offers.remove(&offer.id()).unwrap_or_default();
+                    let text = read_offer_text(&conn, &offer, &mimes);
+                    offer.destroy();
+                    if let Some(text) = text {
+                        break text;
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert_eq!(text, payload);
+        drop(handle);
     }
 
     #[test]

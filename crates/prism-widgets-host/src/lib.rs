@@ -22,6 +22,8 @@ use smithay_client_toolkit::reexports::calloop::{
 };
 use smithay_client_toolkit::reexports::calloop_wayland_source::WaylandSource;
 use smithay_client_toolkit::registry::{ProvidesRegistryState, RegistryState};
+use smithay_client_toolkit::seat::pointer::{PointerEvent, PointerEventKind, PointerHandler};
+use smithay_client_toolkit::seat::{Capability, SeatHandler, SeatState};
 use smithay_client_toolkit::shell::wlr_layer::{
     Anchor, KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface,
     LayerSurfaceConfigure,
@@ -30,16 +32,17 @@ use smithay_client_toolkit::shell::WaylandSurface;
 use smithay_client_toolkit::compositor::FrameCallbackData;
 use smithay_client_toolkit::{delegate_dispatch2, delegate_registry, registry_handlers};
 use wayland_client::globals::registry_queue_init;
-use wayland_client::protocol::{wl_output, wl_surface};
+use wayland_client::protocol::{wl_output, wl_pointer, wl_seat, wl_surface};
 use wayland_client::{Connection, Proxy, QueueHandle};
 
+use damascene_core::event::{EventCx, Pointer, PointerButton, UiEvent};
 use damascene_core::prelude::{App, Rect, Theme};
 use damascene_core::BuildCx;
 use damascene_wgpu::{MsaaTarget, Runner, RunnerCaps};
 
 use prism_widgets_core::{
-    clock_snapshot, ModuleSnapshot, ModuleSpec, ModuleStatus, ModuleUpdate, PanelAnchor, PanelId,
-    PanelLayer, PanelLayout, PanelSnapshot, PanelSpec,
+    clock_snapshot, ModuleAction, ModuleSnapshot, ModuleSpec, ModuleStatus, ModuleUpdate,
+    PanelAnchor, PanelId, PanelLayer, PanelLayout, PanelSnapshot, PanelSpec,
 };
 use prism_widgets_ui::{PanelView, WidgetsBandApp};
 
@@ -47,6 +50,9 @@ use prism_widgets_ui::{PanelView, WidgetsBandApp};
 /// host event loop. Re-exported so provider crates do not need a direct
 /// calloop dependency.
 pub use smithay_client_toolkit::reexports::calloop::channel::Sender;
+/// Constructor and receiving half of the snapshot channel, re-exported for
+/// provider-side integration tests that stand in for the host event loop.
+pub use smithay_client_toolkit::reexports::calloop::channel::{channel as snapshot_channel, Channel};
 
 const MSAA_SAMPLES: u32 = 4;
 const CLOCK_TICK: Duration = Duration::from_secs(1);
@@ -67,7 +73,13 @@ pub type ProviderSpawner =
 
 /// Opaque handle to a running provider generation. Dropping it must stop the
 /// generation's workers (after any in-flight fetch completes).
-pub trait ProviderHandle {}
+pub trait ProviderHandle {
+    /// Route a UI-originated action to whichever worker owns the module.
+    /// The reverse direction of the snapshot channel; the host forwards
+    /// actions opaquely and never interprets the kind. Default: dropped —
+    /// generations without actionable modules need nothing more.
+    fn dispatch(&self, _action: ModuleAction) {}
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct HostConfig {
@@ -247,6 +259,8 @@ pub fn run_layer_shell_with_reload(
     let mut host = LayerHost {
         registry_state: RegistryState::new(&globals),
         output_state: OutputState::new(&globals, &qh),
+        seat_state: SeatState::new(&globals, &qh),
+        pointer: None,
         compositor: CompositorState::bind(&globals, &qh).context("wl_compositor")?,
         layer_shell: LayerShell::bind(&globals, &qh).context("zwlr_layer_shell_v1")?,
         conn: conn.clone(),
@@ -364,6 +378,10 @@ struct PanelSurface {
     height: u32,
     scale: i32,
     dirty: bool,
+    /// Last pointer position over this surface, in surface-local logical
+    /// coordinates. wl_pointer button events carry no coordinates, so
+    /// Press/Release replay the position cached by Enter/Motion.
+    pointer_pos: (f64, f64),
     anim_deadline: Option<Instant>,
     // True once we have committed a frame and requested a `wl_surface.frame`
     // callback that has not yet fired. While set, we hold off drawing and
@@ -379,6 +397,9 @@ struct PanelSurface {
 struct LayerHost {
     registry_state: RegistryState,
     output_state: OutputState,
+    seat_state: SeatState,
+    /// First seat's pointer; a second seat is ignored (single-pointer host).
+    pointer: Option<wl_pointer::WlPointer>,
     compositor: CompositorState,
     layer_shell: LayerShell,
     conn: Connection,
@@ -479,6 +500,7 @@ impl LayerHost {
             height,
             scale: 1,
             dirty: false,
+            pointer_pos: (0.0, 0.0),
             anim_deadline: None,
             awaiting_frame: false,
             last_snapshots: Vec::new(),
@@ -561,6 +583,32 @@ impl LayerHost {
         self.surfaces
             .iter()
             .position(|s| s.layer.wl_surface() == surface)
+    }
+
+    /// Route pointer-derived UI events into the surface's app, then forward
+    /// any actions the app queued to the provider generation. Marks the
+    /// surface dirty when events were dispatched (state may have changed);
+    /// hover-only motion produces no events and takes the `needs_redraw`
+    /// path at the call site instead.
+    fn dispatch_ui_events(&mut self, i: usize, events: Vec<UiEvent>) {
+        if events.is_empty() {
+            return;
+        }
+        let surface = &mut self.surfaces[i];
+        let cx = match surface.swapchain.as_ref() {
+            Some(sc) => EventCx::new().with_ui_state(sc.runner.ui_state()),
+            None => EventCx::new(),
+        };
+        for event in events {
+            surface.app.on_event(event, &cx);
+        }
+        let actions = surface.app.take_actions();
+        surface.dirty = true;
+        for action in actions {
+            if let Some(handle) = self.provider_handle.as_ref() {
+                handle.dispatch(action);
+            }
+        }
     }
 
     fn create_wanted_panels_for_output(
@@ -802,11 +850,129 @@ impl OutputHandler for LayerHost {
     }
 }
 
+impl SeatHandler for LayerHost {
+    fn seat_state(&mut self) -> &mut SeatState {
+        &mut self.seat_state
+    }
+
+    fn new_seat(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _seat: wl_seat::WlSeat) {}
+
+    fn new_capability(
+        &mut self,
+        _conn: &Connection,
+        qh: &QueueHandle<Self>,
+        seat: wl_seat::WlSeat,
+        capability: Capability,
+    ) {
+        if capability == Capability::Pointer && self.pointer.is_none() {
+            self.pointer = self.seat_state.get_pointer(qh, &seat).ok();
+        }
+    }
+
+    fn remove_capability(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _seat: wl_seat::WlSeat,
+        capability: Capability,
+    ) {
+        if capability == Capability::Pointer {
+            if let Some(pointer) = self.pointer.take() {
+                pointer.release();
+            }
+        }
+    }
+
+    fn remove_seat(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _seat: wl_seat::WlSeat) {
+    }
+}
+
+impl PointerHandler for LayerHost {
+    fn pointer_frame(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _pointer: &wl_pointer::WlPointer,
+        events: &[PointerEvent],
+    ) {
+        for event in events {
+            // SCTK positions are surface-local logical coordinates — the same
+            // space damascene's hit-testing runs in (the viewport is built
+            // from the logical size; scale applies at raster time only).
+            let Some(i) = self.surface_index_for(&event.surface) else {
+                continue;
+            };
+            let (x, y) = (event.position.0 as f32, event.position.1 as f32);
+            match event.kind {
+                // Enter carries a valid position, so treating it as a move
+                // both seeds the position cache and starts hover tracking.
+                PointerEventKind::Enter { .. } | PointerEventKind::Motion { .. } => {
+                    self.surfaces[i].pointer_pos = event.position;
+                    let Some(sc) = self.surfaces[i].swapchain.as_mut() else {
+                        continue;
+                    };
+                    let moved = sc.runner.pointer_moved(Pointer::moving(x, y));
+                    let needs_redraw = moved.needs_redraw;
+                    self.dispatch_ui_events(i, moved.events);
+                    if needs_redraw {
+                        self.surfaces[i].dirty = true;
+                    }
+                }
+                PointerEventKind::Leave { .. } => {
+                    let Some(sc) = self.surfaces[i].swapchain.as_mut() else {
+                        continue;
+                    };
+                    let events = sc.runner.pointer_left();
+                    self.dispatch_ui_events(i, events);
+                    self.surfaces[i].dirty = true;
+                }
+                PointerEventKind::Press { button, .. }
+                | PointerEventKind::Release { button, .. } => {
+                    let Some(button) = linux_button(button) else {
+                        continue;
+                    };
+                    // Button events carry no coordinates; replay the cached
+                    // Enter/Motion position.
+                    let (px, py) = {
+                        let pos = self.surfaces[i].pointer_pos;
+                        (pos.0 as f32, pos.1 as f32)
+                    };
+                    let Some(sc) = self.surfaces[i].swapchain.as_mut() else {
+                        continue;
+                    };
+                    let pointer = Pointer::mouse(px, py, button);
+                    let ui_events = if matches!(event.kind, PointerEventKind::Press { .. }) {
+                        sc.runner.pointer_down(pointer)
+                    } else {
+                        sc.runner.pointer_up(pointer)
+                    };
+                    self.dispatch_ui_events(i, ui_events);
+                    self.surfaces[i].dirty = true;
+                }
+                // Nothing in the panels scrolls yet; wire this through
+                // runner.pointer_wheel_event/pointer_wheel when something does.
+                PointerEventKind::Axis { .. } => {}
+            }
+        }
+    }
+}
+
+/// Map evdev button codes to damascene's pointer buttons; other buttons
+/// (side, extra, …) are ignored.
+fn linux_button(code: u32) -> Option<PointerButton> {
+    match code {
+        0x110 => Some(PointerButton::Primary),
+        0x111 => Some(PointerButton::Secondary),
+        0x112 => Some(PointerButton::Middle),
+        _ => None,
+    }
+}
+
 impl ProvidesRegistryState for LayerHost {
     fn registry(&mut self) -> &mut RegistryState {
         &mut self.registry_state
     }
-    registry_handlers![OutputState];
+    registry_handlers![OutputState, SeatState];
 }
 
 delegate_dispatch2!(LayerHost);

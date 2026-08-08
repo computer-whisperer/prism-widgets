@@ -369,11 +369,34 @@ pub struct ListGroup {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ListEntry {
+    /// Stable provider-assigned identity for this entry, present when the
+    /// entry is actionable (clickable). The UI derives its hit-test key from
+    /// it and echoes it back in [`ModuleAction`]s; entries without a key
+    /// render as inert rows.
+    pub key: Option<String>,
     /// Single-line display text for the row.
     pub label: String,
     /// Trailing annotation when the label alone under-describes the entry
     /// (e.g. `"12 lines"` for a multi-line clipboard payload).
     pub meta: Option<String>,
+}
+
+/// A UI-originated action routed back to the provider generation — the
+/// reverse direction of [`ModuleUpdate`]. The host forwards these opaquely
+/// (see `ProviderHandle::dispatch` in the host crate); only the provider
+/// that owns the module interprets the kind.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModuleAction {
+    pub panel: PanelId,
+    pub module: String,
+    pub kind: ModuleActionKind,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ModuleActionKind {
+    /// Re-own the clipboard selection with the history entry identified by
+    /// its [`ListEntry::key`].
+    ClipboardRestore { entry: String },
 }
 
 /// One or more named percentage gauges plus non-numeric context. Produced by

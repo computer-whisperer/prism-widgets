@@ -4,8 +4,8 @@ use std::sync::LazyLock;
 
 use damascene_core::prelude::*;
 use prism_widgets_core::{
-    Gauge, GaugeGroup, ListEntry, ModuleSnapshot, ModuleStatus, ModuleValue, PanelAnchor,
-    PanelAppearance, PanelLayout, PanelSnapshot, ThemeName,
+    Gauge, GaugeGroup, ListEntry, ModuleAction, ModuleActionKind, ModuleSnapshot, ModuleStatus,
+    ModuleValue, PanelAnchor, PanelAppearance, PanelLayout, PanelSnapshot, ThemeName,
 };
 
 const GITHUB_SVG: &str = include_str!("../assets/icons/github.svg");
@@ -53,11 +53,19 @@ impl PanelView {
 pub struct WidgetsBandApp {
     layout: PanelLayout,
     views: Vec<PanelView>,
+    /// Outbox drained by the host after event dispatch (see
+    /// `ProviderHandle::dispatch`): the app can't perform side effects, so
+    /// clicks accumulate here as provider-routed actions.
+    pending_actions: Vec<ModuleAction>,
 }
 
 impl WidgetsBandApp {
     pub fn new(layout: PanelLayout, views: Vec<PanelView>) -> Self {
-        Self { layout, views }
+        Self {
+            layout,
+            views,
+            pending_actions: Vec::new(),
+        }
     }
 
     pub fn set_views(&mut self, views: Vec<PanelView>) {
@@ -65,6 +73,11 @@ impl WidgetsBandApp {
             self.layout = view.layout;
         }
         self.views = views;
+    }
+
+    /// Drain actions queued by event handlers since the last call.
+    pub fn take_actions(&mut self) -> Vec<ModuleAction> {
+        std::mem::take(&mut self.pending_actions)
     }
 }
 
@@ -76,12 +89,48 @@ impl App for WidgetsBandApp {
             .unwrap_or_else(Theme::damascene_dark)
     }
 
-    fn build(&self, _cx: &BuildCx) -> El {
+    fn build(&self, cx: &BuildCx) -> El {
         overlays(
-            cluster_shell(self.layout, &self.views),
+            cluster_shell(self.layout, &self.views, cx),
             Vec::<Option<El>>::new(),
         )
     }
+
+    fn on_event(&mut self, event: UiEvent, _cx: &EventCx) {
+        // Match by recomputing the same keys the build assigned — the
+        // prism-bar idiom. Keys are only ever compared, never parsed, so
+        // panel/module ids are free to contain the separator.
+        for view in &self.views {
+            let panel = &view.snapshot.panel_id;
+            for module in &view.snapshot.modules {
+                let ModuleValue::List(group) = &module.value else {
+                    continue;
+                };
+                for entry in &group.entries {
+                    let Some(entry_key) = &entry.key else {
+                        continue;
+                    };
+                    if event.is_click_or_activate(&entry_el_key(&panel.0, &module.id, entry_key))
+                    {
+                        self.pending_actions.push(ModuleAction {
+                            panel: panel.clone(),
+                            module: module.id.clone(),
+                            kind: ModuleActionKind::ClipboardRestore {
+                                entry: entry_key.clone(),
+                            },
+                        });
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Hit-test key for an actionable list entry. Only ever compared for
+/// equality against `UiEvent::route`, never parsed back apart.
+fn entry_el_key(panel: &str, module: &str, entry: &str) -> String {
+    format!("entry:{panel}:{module}:{entry}")
 }
 
 pub fn theme_of(name: ThemeName) -> Theme {
@@ -97,10 +146,10 @@ pub fn theme_of(name: ThemeName) -> Theme {
     }
 }
 
-fn cluster_shell(layout: PanelLayout, views: &[PanelView]) -> El {
+fn cluster_shell(layout: PanelLayout, views: &[PanelView], cx: &BuildCx) -> El {
     match layout {
         PanelLayout::Bar => bar_shell(views),
-        PanelLayout::Sidebar => sidebar_shell(views),
+        PanelLayout::Sidebar => sidebar_shell(views, cx),
     }
 }
 
@@ -139,8 +188,8 @@ fn bar_shell(views: &[PanelView]) -> El {
     .align(Align::Center)
 }
 
-fn sidebar_shell(views: &[PanelView]) -> El {
-    column(views.iter().map(sidebar_panel_card))
+fn sidebar_shell(views: &[PanelView], cx: &BuildCx) -> El {
+    column(views.iter().map(|view| sidebar_panel_card(view, cx)))
         .fill_size()
         .gap(tokens::SPACE_2)
         .padding(Sides::all(tokens::SPACE_2))
@@ -163,12 +212,13 @@ fn bar_panel_card(view: &PanelView) -> El {
     apply_panel_width(panel, view)
 }
 
-fn sidebar_panel_card(view: &PanelView) -> El {
+fn sidebar_panel_card(view: &PanelView, cx: &BuildCx) -> El {
+    let panel_id = &view.snapshot.panel_id.0;
     let modules = view
         .snapshot
         .modules
         .iter()
-        .map(sidebar_module_item)
+        .map(|module| sidebar_module_item(panel_id, module, cx))
         .collect::<Vec<_>>();
 
     let mut sections = Vec::new();
@@ -257,7 +307,7 @@ fn module_chip(module: &ModuleSnapshot) -> El {
         .radius(tokens::RADIUS_MD)
 }
 
-fn sidebar_module_item(module: &ModuleSnapshot) -> El {
+fn sidebar_module_item(panel_id: &str, module: &ModuleSnapshot, cx: &BuildCx) -> El {
     let gauges = module_gauges(module);
 
     // Keep each entry as short as possible: the detail and value summary ride to
@@ -298,7 +348,12 @@ fn sidebar_module_item(module: &ModuleSnapshot) -> El {
         content.extend(gauges.iter().map(gauge_bar));
     }
     if let ModuleValue::List(group) = &module.value {
-        content.extend(group.entries.iter().map(list_entry_row));
+        content.extend(
+            group
+                .entries
+                .iter()
+                .map(|entry| list_entry_row(panel_id, &module.id, entry, cx)),
+        );
     }
 
     let mut children = Vec::new();
@@ -351,8 +406,9 @@ fn list_headline(count: usize) -> String {
 
 /// One compact row per list entry: the label fills and ellipsizes (same
 /// flexible-title trick as the module header row), the meta caption stays
-/// pinned to the right edge.
-fn list_entry_row(entry: &ListEntry) -> El {
+/// pinned to the right edge. Entries carrying a key become hit targets
+/// with a hover fill; keyless entries render inert.
+fn list_entry_row(panel_id: &str, module_id: &str, entry: &ListEntry, cx: &BuildCx) -> El {
     let mut cells = vec![text(ellipsize(&entry.label, 48))
         .caption()
         .ellipsis()
@@ -360,10 +416,20 @@ fn list_entry_row(entry: &ListEntry) -> El {
     if let Some(meta) = &entry.meta {
         cells.push(text(ellipsize(meta, 14)).caption().muted());
     }
-    row(cells)
+    let mut row_el = row(cells)
         .gap(tokens::SPACE_2)
         .align(Align::Center)
         .width(Size::Fill(1.0))
+        .padding(Sides::xy(tokens::SPACE_1, 2.0))
+        .radius(tokens::RADIUS_SM);
+    if let Some(entry_key) = &entry.key {
+        let el_key = entry_el_key(panel_id, module_id, entry_key);
+        if cx.is_hovering_within(&el_key) {
+            row_el = row_el.fill(tokens::MUTED.with_alpha_u8(60));
+        }
+        row_el = row_el.key(el_key);
+    }
+    row_el
 }
 
 fn module_detail_text(module: &ModuleSnapshot) -> Option<String> {
@@ -669,21 +735,21 @@ mod tests {
     // Sidebar cards must fill the padded column; bars keep their fixed width.
     #[test]
     fn sidebar_card_fills_shell_while_bar_keeps_fixed_width() {
-        let side = sidebar_panel_card(&panel_view(
-            PanelLayout::Sidebar,
-            PanelAnchor::Right,
-            Some(400),
-        ));
+        let theme = Theme::damascene_dark();
+        let cx = BuildCx::new(&theme);
+        let side = sidebar_panel_card(
+            &panel_view(PanelLayout::Sidebar, PanelAnchor::Right, Some(400)),
+            &cx,
+        );
         assert!(
             matches!(side.width, Size::Fill(_)),
             "sidebar card must fill its padded shell, got {:?}",
             side.width
         );
-        let side_left = sidebar_panel_card(&panel_view(
-            PanelLayout::Sidebar,
-            PanelAnchor::Left,
-            Some(400),
-        ));
+        let side_left = sidebar_panel_card(
+            &panel_view(PanelLayout::Sidebar, PanelAnchor::Left, Some(400)),
+            &cx,
+        );
         assert!(
             matches!(side_left.width, Size::Fill(_)),
             "left-anchored sidebar must fill too, got {:?}",
@@ -701,6 +767,84 @@ mod tests {
         );
     }
 
+    #[test]
+    fn clicking_a_keyed_list_entry_queues_a_restore_action() {
+        let clipboard_snapshot = ModuleSnapshot {
+            id: "clipboard".into(),
+            title: "clipboard".into(),
+            value: ModuleValue::List(prism_widgets_core::ListGroup {
+                entries: vec![
+                    ListEntry {
+                        key: Some("7".into()),
+                        label: "hello".into(),
+                        meta: None,
+                    },
+                    ListEntry {
+                        key: None,
+                        label: "inert".into(),
+                        meta: None,
+                    },
+                ],
+            }),
+            status: ModuleStatus::Ok,
+            updated_at: None,
+            stale_after: None,
+        };
+        let view = PanelView::new(
+            PanelAppearance {
+                opacity: 1.0,
+                radius: 12.0,
+                border: true,
+                show_header: false,
+                theme: ThemeName::Dark,
+            },
+            PanelAnchor::Right,
+            PanelLayout::Sidebar,
+            Some(400),
+            PanelSnapshot {
+                panel_id: prism_widgets_core::PanelId::new("side"),
+                modules: vec![clipboard_snapshot],
+            },
+        );
+        let mut app = WidgetsBandApp::new(PanelLayout::Sidebar, vec![view]);
+
+        // The build must key the actionable entry with the same string the
+        // click handler recomputes.
+        let theme = Theme::damascene_dark();
+        let tree = app.build(&BuildCx::new(&theme));
+        let key = entry_el_key("side", "clipboard", "7");
+        assert!(
+            tree_has_key(&tree, &key),
+            "keyed entry row missing from tree"
+        );
+
+        app.on_event(UiEvent::synthetic_click(key), &EventCx::new());
+        let actions = app.take_actions();
+        assert_eq!(
+            actions,
+            vec![ModuleAction {
+                panel: prism_widgets_core::PanelId::new("side"),
+                module: "clipboard".into(),
+                kind: ModuleActionKind::ClipboardRestore { entry: "7".into() },
+            }]
+        );
+        assert!(app.take_actions().is_empty(), "drain must be one-shot");
+
+        // Clicks on unkeyed rows or unknown routes queue nothing.
+        app.on_event(
+            UiEvent::synthetic_click(entry_el_key("side", "clipboard", "nope")),
+            &EventCx::new(),
+        );
+        assert!(app.take_actions().is_empty());
+    }
+
+    fn tree_has_key(node: &damascene_core::tree::El, key: &str) -> bool {
+        if node.key.as_deref() == Some(key) {
+            return true;
+        }
+        node.children.iter().any(|child| tree_has_key(child, key))
+    }
+
     fn find_badge(node: &damascene_core::tree::El) -> Option<&damascene_core::tree::El> {
         if node.kind == damascene_core::tree::Kind::Badge {
             return Some(node);
@@ -711,9 +855,13 @@ mod tests {
     fn badge_rect(title: &str, detail: &str) -> damascene_core::tree::Rect {
         use damascene_core::tree::Rect;
         let snap = github_module(title, detail);
+        let theme = Theme::damascene_dark();
+        let cx = BuildCx::new(&theme);
         // Mirror sidebar_panel_card + apply_panel_width at the user's 400px.
-        let mut root = card([card_content([item_group([sidebar_module_item(&snap)])])
-            .padding(Sides::xy(tokens::SPACE_2, tokens::SPACE_2))])
+        let mut root = card([
+            card_content([item_group([sidebar_module_item("p", &snap, &cx)])])
+                .padding(Sides::xy(tokens::SPACE_2, tokens::SPACE_2)),
+        ])
         .width(Size::Fixed(400.0));
         let mut state = damascene_core::state::UiState::new();
         damascene_core::layout::layout(&mut root, &mut state, Rect::new(0.0, 0.0, 400.0, 600.0));

@@ -52,6 +52,29 @@ recorded, truncated at 128 KiB. `examples/clipboard-tool.rs` exercises the
 same protocol from the other side (get/set/clear) for end-to-end testing
 without wl-clipboard.
 
+## Input and Actions
+
+The host binds the first seat's pointer (`SeatState`; the
+`delegate_dispatch2!` blanket covers the seat objects, so no extra delegates)
+and feeds surface-local logical positions into the target surface's damascene
+`Runner`, which synthesizes `UiEvent`s. The host dispatches those into
+`WidgetsBandApp::on_event`; the app can't perform side effects, so clicks
+accumulate in an outbox of `ModuleAction`s that the host drains after
+dispatch and forwards through `ProviderHandle::dispatch` — the reverse
+direction of the snapshot channel, equally opaque to the host.
+
+Clipboard restore is the first consumer: clicking a history row routes a
+`ClipboardRestore` to the watcher (via an mpsc channel plus a wake pipe that
+interrupts its poll), which re-owns the selection with that entry's text and
+promotes the entry when the compositor echoes the selection back — the echo,
+not the click, is the source of truth for history order. While serving, the
+watcher skips reading its own offers (a self-read would deadlock against its
+own `Send` handler).
+
+Not yet wired: keyboard (layer surfaces keep `KeyboardInteractivity::None`),
+cursor shape (the compositor default shows over panels), touch, and Axis
+(scroll) events — dropped until something scrolls.
+
 Each provider generation carries an `epoch`. On config reload the host drops
 the old `SchedulerHandle` (signalling its workers to stop), bumps the epoch,
 and spawns a fresh generation; snapshots from workers still mid-fetch arrive
