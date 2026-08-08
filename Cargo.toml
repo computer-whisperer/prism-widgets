@@ -12,17 +12,17 @@ authors = ["Christian Balcom"]
 
 [workspace.dependencies]
 anyhow = "1"
-base64 = "0.22"
+base64 = "0.23"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
-damascene-core = "0.6.0"
-damascene-wgpu = "0.6.0"
+damascene-core = "0.7.0"
+damascene-wgpu = "0.7.0"
 knuffel = "3.2.0"
 miette = { version = "5.10.0", features = ["fancy-no-backtrace"] }
-pollster = "0.4"
+pollster = "1"
 raw-window-handle = "0.6"
 rustix = { version = "1", features = ["fs"] }
 serde_json = "1"
-smithay-client-toolkit = { version = "0.20", default-features = false, features = ["calloop"] }
+smithay-client-toolkit = { version = "0.21", default-features = false, features = ["calloop"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ureq = "3"

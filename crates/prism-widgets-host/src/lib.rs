@@ -27,9 +27,8 @@ use smithay_client_toolkit::shell::wlr_layer::{
     LayerSurfaceConfigure,
 };
 use smithay_client_toolkit::shell::WaylandSurface;
-use smithay_client_toolkit::{
-    delegate_compositor, delegate_layer, delegate_output, delegate_registry, registry_handlers,
-};
+use smithay_client_toolkit::compositor::FrameCallbackData;
+use smithay_client_toolkit::{delegate_dispatch2, delegate_registry, registry_handlers};
 use wayland_client::globals::registry_queue_init;
 use wayland_client::protocol::{wl_output, wl_surface};
 use wayland_client::{Connection, Proxy, QueueHandle};
@@ -810,9 +809,7 @@ impl ProvidesRegistryState for LayerHost {
     registry_handlers![OutputState];
 }
 
-delegate_compositor!(LayerHost);
-delegate_output!(LayerHost);
-delegate_layer!(LayerHost);
+delegate_dispatch2!(LayerHost);
 delegate_registry!(LayerHost);
 
 fn watch_config(event_loop: &mut EventLoop<LayerHost>, path: &Path) -> Result<()> {
@@ -1263,7 +1260,7 @@ fn render_frame<A: App>(
     // callback back to `CompositorHandler::frame` via the surface user-data.
     target
         .wl_surface
-        .frame(target.qh, target.wl_surface.clone());
+        .frame(target.qh, FrameCallbackData(target.wl_surface.clone()));
     gpu.queue.present(frame);
 
     let mut anim_deadline = prepare.next_redraw_in.map(|delay| Instant::now() + delay);
