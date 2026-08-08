@@ -4,8 +4,8 @@ use std::sync::LazyLock;
 
 use damascene_core::prelude::*;
 use prism_widgets_core::{
-    Gauge, GaugeGroup, ModuleSnapshot, ModuleStatus, ModuleValue, PanelAnchor, PanelAppearance,
-    PanelLayout, PanelSnapshot, ThemeName,
+    Gauge, GaugeGroup, ListEntry, ModuleSnapshot, ModuleStatus, ModuleValue, PanelAnchor,
+    PanelAppearance, PanelLayout, PanelSnapshot, ThemeName,
 };
 
 const GITHUB_SVG: &str = include_str!("../assets/icons/github.svg");
@@ -297,6 +297,9 @@ fn sidebar_module_item(module: &ModuleSnapshot) -> El {
     } else {
         content.extend(gauges.iter().map(gauge_bar));
     }
+    if let ModuleValue::List(group) = &module.value {
+        content.extend(group.entries.iter().map(list_entry_row));
+    }
 
     let mut children = Vec::new();
     if let Some(glyph) = module_brand_icon(module) {
@@ -332,7 +335,35 @@ fn module_value_plain(module: &ModuleSnapshot) -> String {
         },
         ModuleValue::State { label, .. } => ellipsize(label, 36),
         ModuleValue::Gauges(group) => ellipsize(&gauge_headline(group), 36),
+        ModuleValue::List(group) => list_headline(group.entries.len()),
     }
+}
+
+/// Compact one-line summary of a list module: its entry count. Doubles as
+/// the whole rendering in bar chips, where per-entry rows don't fit.
+fn list_headline(count: usize) -> String {
+    match count {
+        0 => "empty".into(),
+        1 => "1 item".into(),
+        n => format!("{n} items"),
+    }
+}
+
+/// One compact row per list entry: the label fills and ellipsizes (same
+/// flexible-title trick as the module header row), the meta caption stays
+/// pinned to the right edge.
+fn list_entry_row(entry: &ListEntry) -> El {
+    let mut cells = vec![text(ellipsize(&entry.label, 48))
+        .caption()
+        .ellipsis()
+        .width(Size::Fill(1.0))];
+    if let Some(meta) = &entry.meta {
+        cells.push(text(ellipsize(meta, 14)).caption().muted());
+    }
+    row(cells)
+        .gap(tokens::SPACE_2)
+        .align(Align::Center)
+        .width(Size::Fill(1.0))
 }
 
 fn module_detail_text(module: &ModuleSnapshot) -> Option<String> {

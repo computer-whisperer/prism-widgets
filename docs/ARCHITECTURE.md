@@ -26,6 +26,7 @@
 - GitHub CI/check/run status
 - Codex/Claude/subscription usage probes
 - command/file/local metric adapters
+- clipboard history via ext-data-control (event-driven, see below)
 - future Prism IPC event-stream provider
 
 `prism-widgets-ui` turns snapshots into Damascene `El` trees. It should not
@@ -40,6 +41,16 @@ channel. The host holds a lock-free `SnapshotCache` it reads at draw time and
 mutates only from the channel callback. The clock is the exception: it is a
 pure function of the current time, so the host renders it locally on a 1-second
 tick rather than on a worker.
+
+The clipboard module is the first event-driven provider: its worker opens its
+own Wayland connection (never the host's — the provider seam stays one-way),
+registers as an ext-data-control clipboard manager, and pushes a snapshot when
+the selection changes instead of on a timer. It idles in a 500ms-timeout poll
+on the connection fd, which is also how it notices shutdown. Selections
+offering `x-kde-passwordManagerHint` are never read; only text mimes are
+recorded, truncated at 128 KiB. `examples/clipboard-tool.rs` exercises the
+same protocol from the other side (get/set/clear) for end-to-end testing
+without wl-clipboard.
 
 Each provider generation carries an `epoch`. On config reload the host drops
 the old `SchedulerHandle` (signalling its workers to stop), bumps the epoch,

@@ -4,6 +4,8 @@
 //! in the common host runner. This keeps `prism-bar` free to reuse the
 //! host path without inheriting API-client dependencies.
 
+mod clipboard;
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -133,24 +135,42 @@ impl Drop for SchedulerHandle {
 
 /// Spawn a worker per polled module, pushing snapshots into `sender` tagged
 /// with `epoch`. Clock modules are skipped — the host renders them locally.
+/// Clipboard modules get an event-driven watcher thread instead of a poll
+/// loop; it notices shutdown within its idle poll tick (≤500ms).
 pub fn start_scheduler(specs: &[PanelSpec], sender: SnapshotSender, epoch: u64) -> SchedulerHandle {
     let shutdown = Arc::new(AtomicBool::new(false));
     let mut workers = Vec::new();
     for panel in specs {
         for module in &panel.modules {
-            let Some(interval) = module.poll_interval() else {
-                continue;
-            };
-            let panel_id = panel.id.clone();
-            let module_id = module.id().to_string();
-            let spec = module.clone();
-            let sender = sender.clone();
-            let shutdown = Arc::clone(&shutdown);
-            workers.push(thread::spawn(move || {
-                poll_module(
-                    &spec, panel_id, module_id, interval, epoch, &sender, &shutdown,
-                );
-            }));
+            match module {
+                ModuleSpec::Clipboard(spec) => {
+                    let spec = spec.clone();
+                    let panel_id = panel.id.clone();
+                    let module_id = module.id().to_string();
+                    let sender = sender.clone();
+                    let shutdown = Arc::clone(&shutdown);
+                    workers.push(thread::spawn(move || {
+                        clipboard::watch_clipboard(
+                            &spec, panel_id, module_id, epoch, &sender, &shutdown,
+                        );
+                    }));
+                }
+                module => {
+                    let Some(interval) = module.poll_interval() else {
+                        continue;
+                    };
+                    let panel_id = panel.id.clone();
+                    let module_id = module.id().to_string();
+                    let spec = module.clone();
+                    let sender = sender.clone();
+                    let shutdown = Arc::clone(&shutdown);
+                    workers.push(thread::spawn(move || {
+                        poll_module(
+                            &spec, panel_id, module_id, interval, epoch, &sender, &shutdown,
+                        );
+                    }));
+                }
+            }
         }
     }
     SchedulerHandle { shutdown, workers }
@@ -209,6 +229,10 @@ fn fetch_module(spec: &ModuleSpec) -> ModuleSnapshot {
         ModuleSpec::Cpu(spec) => cpu_snapshot(spec),
         ModuleSpec::Memory(spec) => memory_snapshot(spec),
         ModuleSpec::Gpu(spec) => gpu_snapshot(spec),
+        // Never scheduled here (no poll interval); the placeholder keeps the
+        // match exhaustive and the dry-run path honest — clipboard history
+        // only exists in a live watching session.
+        ModuleSpec::Clipboard(spec) => ModuleSnapshot::loading(&spec.id, "clipboard"),
     }
 }
 
@@ -234,6 +258,7 @@ impl SnapshotStore {
             ModuleSpec::Cpu(spec) => cpu_snapshot(spec),
             ModuleSpec::Memory(spec) => memory_snapshot(spec),
             ModuleSpec::Gpu(spec) => gpu_snapshot(spec),
+            ModuleSpec::Clipboard(spec) => ModuleSnapshot::loading(&spec.id, "clipboard"),
         };
 
         self.cache.lock().expect("snapshot cache").insert(

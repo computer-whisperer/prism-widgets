@@ -28,6 +28,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ureq = "3"
 wayland-backend = { version = "0.3", features = ["client_system"] }
 wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
 wgpu = "30"
 
 prism-widgets-core = { path = "crates/prism-widgets-core" }

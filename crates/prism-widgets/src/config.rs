@@ -3,9 +3,9 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use prism_widgets_core::{
-    ClockSpec, CommandSpec, CpuSpec, GitHubSpec, GitLabSpec, GpuSpec, MemorySpec, ModuleSpec,
-    PanelAnchor, PanelAppearance, PanelGeometry, PanelId, PanelLayer, PanelLayout, PanelSpec,
-    StatusPageSpec, ThemeName, UsageSpec,
+    ClipboardSpec, ClockSpec, CommandSpec, CpuSpec, GitHubSpec, GitLabSpec, GpuSpec, MemorySpec,
+    ModuleSpec, PanelAnchor, PanelAppearance, PanelGeometry, PanelId, PanelLayer, PanelLayout,
+    PanelSpec, StatusPageSpec, ThemeName, UsageSpec,
 };
 
 #[derive(Debug, knuffel::Decode)]
@@ -75,6 +75,7 @@ enum ModuleNode {
     Cpu(CpuNode),
     Memory(MemoryNode),
     Gpu(GpuNode),
+    Clipboard(ClipboardNode),
 }
 
 #[derive(Debug, knuffel::Decode)]
@@ -193,6 +194,14 @@ struct GpuNode {
     id: Option<String>,
     #[knuffel(property, default = 3)]
     interval: u64,
+}
+
+#[derive(Debug, knuffel::Decode)]
+struct ClipboardNode {
+    #[knuffel(property, default = String::from("clipboard"))]
+    id: String,
+    #[knuffel(property(name = "max-entries"), default = 8)]
+    max_entries: usize,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -390,6 +399,12 @@ impl Config {
                     ModuleNode::Gpu(gpu) if gpu.interval == 0 => {
                         anyhow::bail!("gpu card={}: interval must be at least 1", gpu.card);
                     }
+                    ModuleNode::Clipboard(clipboard) if clipboard.max_entries == 0 => {
+                        anyhow::bail!(
+                            "clipboard {:?}: max-entries must be at least 1",
+                            clipboard.id
+                        );
+                    }
                     _ => {}
                 }
             }
@@ -567,6 +582,10 @@ impl ModuleNode {
                 card: gpu.card,
                 interval: Duration::from_secs(gpu.interval),
             }),
+            ModuleNode::Clipboard(clipboard) => ModuleSpec::Clipboard(ClipboardSpec {
+                id: clipboard.id.clone(),
+                max_entries: clipboard.max_entries,
+            }),
         }
     }
 }
@@ -683,6 +702,53 @@ mod tests {
         assert_eq!(config.panel_specs()[0].id.0, "top");
 
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn clipboard_module_parses_with_defaults_and_overrides() {
+        let config = parse_config(
+            r#"
+            panel "right-sidebar" {
+                anchor "right"
+                layout "sidebar"
+                modules {
+                    clipboard
+                    clipboard id="clips" max-entries=20
+                }
+            }
+            "#,
+        );
+
+        let modules = &config.panel_specs()[0].modules;
+        assert_eq!(
+            modules[0],
+            ModuleSpec::Clipboard(ClipboardSpec {
+                id: "clipboard".into(),
+                max_entries: 8,
+            })
+        );
+        assert_eq!(
+            modules[1],
+            ModuleSpec::Clipboard(ClipboardSpec {
+                id: "clips".into(),
+                max_entries: 20,
+            })
+        );
+    }
+
+    #[test]
+    fn clipboard_max_entries_zero_is_rejected() {
+        let text = r#"
+            panel "right-sidebar" {
+                anchor "right"
+                layout "sidebar"
+                modules {
+                    clipboard max-entries=0
+                }
+            }
+            "#;
+        let config = knuffel::parse::<Config>("test.kdl", text).unwrap();
+        assert!(config.validate().is_err());
     }
 
     fn parse_config(text: &str) -> Config {

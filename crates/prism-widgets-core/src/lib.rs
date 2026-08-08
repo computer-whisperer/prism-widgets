@@ -93,6 +93,7 @@ pub enum ModuleSpec {
     Cpu(CpuSpec),
     Memory(MemorySpec),
     Gpu(GpuSpec),
+    Clipboard(ClipboardSpec),
 }
 
 impl ModuleSpec {
@@ -107,6 +108,7 @@ impl ModuleSpec {
             ModuleSpec::Cpu(spec) => &spec.id,
             ModuleSpec::Memory(spec) => &spec.id,
             ModuleSpec::Gpu(spec) => &spec.id,
+            ModuleSpec::Clipboard(spec) => &spec.id,
         }
     }
 
@@ -121,11 +123,14 @@ impl ModuleSpec {
 
     /// Background refresh interval for modules polled on worker threads.
     ///
-    /// `None` for modules the host renders locally and synchronously (the
-    /// clock), which are never scheduled on a worker.
+    /// `None` for modules that are never polled: the clock is rendered
+    /// locally and synchronously by the host, and the clipboard watcher is
+    /// event-driven — its worker blocks on a Wayland connection and pushes
+    /// on selection changes rather than on a timer.
     pub fn poll_interval(&self) -> Option<Duration> {
         match self {
             ModuleSpec::Clock(_) => None,
+            ModuleSpec::Clipboard(_) => None,
             ModuleSpec::Command(spec) => Some(spec.interval),
             ModuleSpec::GitHub(spec) => Some(spec.interval),
             ModuleSpec::GitLab(spec) => Some(spec.interval),
@@ -272,6 +277,19 @@ pub struct GpuSpec {
     pub interval: Duration,
 }
 
+/// A rolling history of text clipboard selections, observed through the
+/// compositor's ext-data-control global. Event-driven rather than polled:
+/// see [`ModuleSpec::poll_interval`].
+///
+/// Selections offering the `x-kde-passwordManagerHint` mime type (password
+/// managers marking sensitive copies) are never recorded.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClipboardSpec {
+    pub id: String,
+    /// Most-recent entries kept and shown, newest first.
+    pub max_entries: usize,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct PanelSnapshot {
     pub panel_id: PanelId,
@@ -335,6 +353,27 @@ pub enum ModuleValue {
         detail: Option<String>,
     },
     Gauges(GaugeGroup),
+    List(ListGroup),
+}
+
+/// An ordered list of short text rows, newest or most important first.
+/// Produced by modules whose value is inherently a collection — clipboard
+/// history today — and rendered as one compact row per entry in sidebars.
+///
+/// Entries are display strings prepared by the provider (first line of a
+/// multi-line payload, etc.); the UI only ellipsizes them to fit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ListGroup {
+    pub entries: Vec<ListEntry>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ListEntry {
+    /// Single-line display text for the row.
+    pub label: String,
+    /// Trailing annotation when the label alone under-describes the entry
+    /// (e.g. `"12 lines"` for a multi-line clipboard payload).
+    pub meta: Option<String>,
 }
 
 /// One or more named percentage gauges plus non-numeric context. Produced by

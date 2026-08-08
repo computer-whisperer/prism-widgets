@@ -9,10 +9,14 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+anyhow.workspace = true
 base64.workspace = true
 chrono.workspace = true
 prism-widgets-core.workspace = true
 prism-widgets-host.workspace = true
+rustix = { workspace = true, features = ["event", "pipe"] }
 serde_json.workspace = true
 tracing.workspace = true
 ureq.workspace = true
+wayland-client.workspace = true
+wayland-protocols.workspace = true

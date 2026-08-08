@@ -1611,13 +1611,17 @@ dependencies = [
 name = "prism-widgets-providers"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "base64 0.23.1",
  "chrono",
  "prism-widgets-core",
  "prism-widgets-host",
+ "rustix",
  "serde_json",
  "tracing",
  "ureq",
+ "wayland-client",
+ "wayland-protocols",
 ]
 
 [[package]]
