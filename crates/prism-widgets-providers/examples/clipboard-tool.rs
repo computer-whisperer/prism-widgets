@@ -62,7 +62,10 @@ fn main() {
             print!("{text}");
         }
         "set" => {
-            state.payload = args.next().expect("set needs a payload argument").into_bytes();
+            state.payload = args
+                .next()
+                .expect("set needs a payload argument")
+                .into_bytes();
             let source = manager.create_data_source(&qh, ());
             source.offer(TEXT_MIME.to_string());
             source.offer("text/plain".to_string());
@@ -75,7 +78,13 @@ fn main() {
         "set-image" => {
             let path = args.next().expect("set-image needs a file path");
             state.payload = std::fs::read(&path).expect("read image file");
-            let mime = match path.rsplit('.').next().unwrap_or("").to_ascii_lowercase().as_str() {
+            let mime = match path
+                .rsplit('.')
+                .next()
+                .unwrap_or("")
+                .to_ascii_lowercase()
+                .as_str()
+            {
                 "png" => "image/png",
                 "jpg" | "jpeg" => "image/jpeg",
                 "webp" => "image/webp",

@@ -13,6 +13,7 @@ use anyhow::{Context, Result};
 use raw_window_handle::{
     RawDisplayHandle, RawWindowHandle, WaylandDisplayHandle, WaylandWindowHandle,
 };
+use smithay_client_toolkit::compositor::FrameCallbackData;
 use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState};
 use smithay_client_toolkit::output::{OutputHandler, OutputState};
 use smithay_client_toolkit::reexports::calloop::{
@@ -29,7 +30,6 @@ use smithay_client_toolkit::shell::wlr_layer::{
     LayerSurfaceConfigure,
 };
 use smithay_client_toolkit::shell::WaylandSurface;
-use smithay_client_toolkit::compositor::FrameCallbackData;
 use smithay_client_toolkit::{delegate_dispatch2, delegate_registry, registry_handlers};
 use wayland_client::globals::registry_queue_init;
 use wayland_client::protocol::{wl_output, wl_pointer, wl_seat, wl_surface};
@@ -52,7 +52,9 @@ use prism_widgets_ui::{PanelView, WidgetsBandApp};
 pub use smithay_client_toolkit::reexports::calloop::channel::Sender;
 /// Constructor and receiving half of the snapshot channel, re-exported for
 /// provider-side integration tests that stand in for the host event loop.
-pub use smithay_client_toolkit::reexports::calloop::channel::{channel as snapshot_channel, Channel};
+pub use smithay_client_toolkit::reexports::calloop::channel::{
+    channel as snapshot_channel, Channel,
+};
 
 const MSAA_SAMPLES: u32 = 4;
 const CLOCK_TICK: Duration = Duration::from_secs(1);

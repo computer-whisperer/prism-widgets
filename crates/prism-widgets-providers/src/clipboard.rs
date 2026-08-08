@@ -169,7 +169,9 @@ impl std::fmt::Debug for Payload {
         match self {
             Payload::Text(text) => f.debug_tuple("Text").field(text).finish(),
             Payload::Uris(body) => f.debug_tuple("Uris").field(body).finish(),
-            Payload::Image { mime, bytes, dims, .. } => f
+            Payload::Image {
+                mime, bytes, dims, ..
+            } => f
                 .debug_struct("Image")
                 .field("mime", mime)
                 .field("len", &bytes.len())
@@ -188,10 +190,14 @@ impl PartialEq for Payload {
             (Payload::Uris(a), Payload::Uris(b)) => a == b,
             (
                 Payload::Image {
-                    mime: am, bytes: ab, ..
+                    mime: am,
+                    bytes: ab,
+                    ..
                 },
                 Payload::Image {
-                    mime: bm, bytes: bb, ..
+                    mime: bm,
+                    bytes: bb,
+                    ..
                 },
             ) => am == bm && ab == bb,
             _ => false,
@@ -938,20 +944,12 @@ impl Dispatch<ExtDataControlSourceV1, ()> for WatchState {
             Event::Send { mime_type, fd } => {
                 // Serve only for the live source; a Send racing its own
                 // cancellation gets nothing (receiver sees EOF).
-                if let Some(own) = state
-                    .own
-                    .as_ref()
-                    .filter(|own| own.source == *source)
-                {
+                if let Some(own) = state.own.as_ref().filter(|own| own.source == *source) {
                     write_bounded(fd, &own.payload.bytes_for(&mime_type));
                 }
             }
             Event::Cancelled => {
-                if state
-                    .own
-                    .as_ref()
-                    .is_some_and(|own| own.source == *source)
-                {
+                if state.own.as_ref().is_some_and(|own| own.source == *source) {
                     state.own = None;
                 }
                 source.destroy();
@@ -1321,12 +1319,11 @@ mod tests {
         // Round 2: image. A tiny PNG round-trips byte-exactly, and the
         // recorded entry must carry decoded dims and a thumbnail.
         let mut png = Vec::new();
-        image::RgbaImage::from_fn(3, 2, |x, y| image::Rgba([x as u8 * 80, y as u8 * 100, 7, 255]))
-            .write_to(
-                &mut std::io::Cursor::new(&mut png),
-                image::ImageFormat::Png,
-            )
-            .expect("encode test png");
+        image::RgbaImage::from_fn(3, 2, |x, y| {
+            image::Rgba([x as u8 * 80, y as u8 * 100, 7, 255])
+        })
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .expect("encode test png");
         let image_payload = Payload::Image {
             mime: "image/png".into(),
             bytes: Arc::new(png),
@@ -1365,7 +1362,11 @@ mod tests {
         }
 
         let (bytes, truncated) = read_pipe(&[7u8; 1000], 1000).unwrap();
-        assert_eq!((bytes.len(), truncated), (1000, false), "exact cap is complete");
+        assert_eq!(
+            (bytes.len(), truncated),
+            (1000, false),
+            "exact cap is complete"
+        );
         let (bytes, truncated) = read_pipe(&[7u8; 1001], 1000).unwrap();
         assert_eq!((bytes.len(), truncated), (1000, true), "over cap truncates");
         let (bytes, truncated) = read_pipe(&[7u8; 500], 1000).unwrap();
@@ -1400,10 +1401,7 @@ mod tests {
             Some(MimeChoice::Text("text/plain;charset=UTF-8"))
         ));
         let with_uris = vec!["text/plain".to_string(), "text/uri-list".to_string()];
-        assert!(matches!(
-            choose_mime(&with_uris),
-            Some(MimeChoice::Uris(_))
-        ));
+        assert!(matches!(choose_mime(&with_uris), Some(MimeChoice::Uris(_))));
         let image_only = vec!["image/jpeg".to_string(), "image/png".to_string()];
         assert!(matches!(
             choose_mime(&image_only),

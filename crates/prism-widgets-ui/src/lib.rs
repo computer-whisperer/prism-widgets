@@ -110,8 +110,7 @@ impl App for WidgetsBandApp {
                     let Some(entry_key) = &entry.key else {
                         continue;
                     };
-                    if event.is_click_or_activate(&entry_el_key(&panel.0, &module.id, entry_key))
-                    {
+                    if event.is_click_or_activate(&entry_el_key(&panel.0, &module.id, entry_key)) {
                         self.pending_actions.push(ModuleAction {
                             panel: panel.clone(),
                             module: module.id.clone(),
