@@ -115,7 +115,7 @@ impl App for WidgetsBandApp {
                         self.pending_actions.push(ModuleAction {
                             panel: panel.clone(),
                             module: module.id.clone(),
-                            kind: ModuleActionKind::ClipboardRestore {
+                            kind: ModuleActionKind::ActivateEntry {
                                 entry: entry_key.clone(),
                             },
                         });
@@ -127,10 +127,17 @@ impl App for WidgetsBandApp {
     }
 }
 
-/// Hit-test key for an actionable list entry. Only ever compared for
-/// equality against `UiEvent::route`, never parsed back apart.
+/// Hit-test key for an actionable list entry. Never parsed back apart, but
+/// it must be *injective*: two distinct (panel, module, entry) triples must
+/// never collide, or a click could route to the wrong module. Panel and
+/// module ids come from user config and may contain the separator, so their
+/// lengths are baked in to pin the field boundaries.
 fn entry_el_key(panel: &str, module: &str, entry: &str) -> String {
-    format!("entry:{panel}:{module}:{entry}")
+    format!(
+        "entry:{}:{panel}:{}:{module}:{entry}",
+        panel.len(),
+        module.len()
+    )
 }
 
 pub fn theme_of(name: ThemeName) -> Theme {
@@ -825,7 +832,7 @@ mod tests {
             vec![ModuleAction {
                 panel: prism_widgets_core::PanelId::new("side"),
                 module: "clipboard".into(),
-                kind: ModuleActionKind::ClipboardRestore { entry: "7".into() },
+                kind: ModuleActionKind::ActivateEntry { entry: "7".into() },
             }]
         );
         assert!(app.take_actions().is_empty(), "drain must be one-shot");

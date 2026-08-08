@@ -221,7 +221,7 @@ fn handle_action(
     kind: ModuleActionKind,
 ) {
     match kind {
-        ModuleActionKind::ClipboardRestore { entry } => {
+        ModuleActionKind::ActivateEntry { entry } => {
             let Ok(key) = entry.parse::<u64>() else {
                 tracing::warn!("malformed clipboard entry key {entry:?}");
                 return;
@@ -278,9 +278,11 @@ fn absorb_selection(
         // Receiving from ourselves would deadlock — the pipe only fills
         // when we dispatch our own Send event — and we already know the
         // text; promote the restored entry instead. A foreign copy racing
-        // this is resolved by ordering: the compositor cancels our source
-        // before announcing the foreign selection, and `Cancelled` clears
-        // `own` earlier in the same dispatch batch.
+        // this is resolved by ordering: Smithay cancels our source before
+        // broadcasting the new selection (the protocol itself mandates no
+        // order), so `Cancelled` clears `own` earlier in the same dispatch
+        // batch. A compositor that delayed `cancelled` to a later batch
+        // would mis-record one foreign copy as a promote.
         offer.destroy();
         return history.promote(own.entry);
     }
@@ -666,6 +668,15 @@ impl Dispatch<ExtDataControlSourceV1, ()> for WatchState {
 /// deadline as reads: a receiver that never drains its pipe costs us at
 /// most `RECEIVE_TIMEOUT`, then sees a short payload.
 fn write_bounded(fd: rustix::fd::OwnedFd, bytes: &[u8]) {
+    // The receiver created this fd and blocking pipes are the norm; a
+    // blocking write() transfers ALL bytes before returning, which would
+    // ignore the deadline and wedge the watcher inside its own Send
+    // handler on a stalled receiver. Force O_NONBLOCK so poll(OUT) +
+    // WouldBlock does the pacing as written below.
+    if let Err(err) = rustix::fs::fcntl_setfl(&fd, rustix::fs::OFlags::NONBLOCK) {
+        tracing::warn!("clipboard serve fcntl: {err}");
+        return;
+    }
     let mut file = std::fs::File::from(fd);
     let deadline = Instant::now() + RECEIVE_TIMEOUT;
     let mut offset = 0;
@@ -880,7 +891,7 @@ mod tests {
         handle.dispatch(ModuleAction {
             panel,
             module: "clipboard".into(),
-            kind: ModuleActionKind::ClipboardRestore { entry: entry_key },
+            kind: ModuleActionKind::ActivateEntry { entry: entry_key },
         });
 
         // The watcher re-owns the selection: our seed source gets cancelled

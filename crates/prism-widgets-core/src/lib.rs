@@ -394,9 +394,11 @@ pub struct ModuleAction {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ModuleActionKind {
-    /// Re-own the clipboard selection with the history entry identified by
-    /// its [`ListEntry::key`].
-    ClipboardRestore { entry: String },
+    /// The user activated (clicked) the list entry identified by its
+    /// [`ListEntry::key`]. What activation means is the owning provider's
+    /// call — the clipboard watcher re-owns the selection with the entry's
+    /// text; the UI attaches no semantics.
+    ActivateEntry { entry: String },
 }
 
 /// One or more named percentage gauges plus non-numeric context. Produced by

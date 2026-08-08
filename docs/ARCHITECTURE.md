@@ -63,13 +63,15 @@ accumulate in an outbox of `ModuleAction`s that the host drains after
 dispatch and forwards through `ProviderHandle::dispatch` — the reverse
 direction of the snapshot channel, equally opaque to the host.
 
-Clipboard restore is the first consumer: clicking a history row routes a
-`ClipboardRestore` to the watcher (via an mpsc channel plus a wake pipe that
+Clipboard restore is the first consumer: clicking a history row routes an
+`ActivateEntry` to the watcher (via an mpsc channel plus a wake pipe that
 interrupts its poll), which re-owns the selection with that entry's text and
 promotes the entry when the compositor echoes the selection back — the echo,
 not the click, is the source of truth for history order. While serving, the
 watcher skips reading its own offers (a self-read would deadlock against its
-own `Send` handler).
+own `Send` handler). Known limitation: a config reload (or exit) while the
+watcher owns a restored selection drops its connection and clears the
+clipboard — selection ownership does not hand over across generations.
 
 Not yet wired: keyboard (layer surfaces keep `KeyboardInteractivity::None`),
 cursor shape (the compositor default shows over panels), touch, and Axis
