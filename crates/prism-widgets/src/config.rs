@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -351,7 +352,11 @@ impl Config {
         if self.panels.is_empty() {
             anyhow::bail!("config must contain at least one panel");
         }
+        let mut panel_ids = HashSet::new();
         for panel in &self.panels {
+            if !panel_ids.insert(panel.id.as_str()) {
+                anyhow::bail!("duplicate panel id {:?}", panel.id);
+            }
             let layout = panel.resolved_layout();
             if layout == PanelLayout::Sidebar
                 && !matches!(panel.anchor, AnchorName::Left | AnchorName::Right)
@@ -367,7 +372,19 @@ impl Config {
             if !(0.0..=1.0).contains(&panel.opacity) {
                 anyhow::bail!("panel {:?}: opacity must be within 0.0..=1.0", panel.id);
             }
+            // Snapshots are cached by (panel, module id), so two modules
+            // sharing an id would silently display whichever fetch landed
+            // last. Check resolved ids (defaults included), not just
+            // explicit ones.
+            let mut module_ids = HashSet::new();
             for module in &panel.modules.list {
+                let id = module.to_spec().id().to_string();
+                if !module_ids.insert(id.clone()) {
+                    anyhow::bail!(
+                        "panel {:?}: duplicate module id {id:?}; set id=\"...\" to disambiguate",
+                        panel.id
+                    );
+                }
                 match module {
                     ModuleNode::Clock(clock) => {
                         let _ = chrono::Local::now().format(&clock.format).to_string();
@@ -530,12 +547,14 @@ impl ModuleNode {
             }),
             ModuleNode::Gitlab(gitlab) => ModuleSpec::GitLab(GitLabSpec {
                 // Default id carries a `gitlab:` marker so the UI shows the
-                // GitLab brand icon: a bare `group/project` id is
-                // indistinguishable from a GitHub `owner/repo`.
-                id: gitlab
-                    .id
-                    .clone()
-                    .unwrap_or_else(|| format!("gitlab:{}", gitlab.project)),
+                // GitLab brand icon (a bare `group/project` id is
+                // indistinguishable from a GitHub `owner/repo`), plus the
+                // host so the same project path on two GitLab servers
+                // cannot collide in the snapshot cache.
+                id: gitlab.id.clone().unwrap_or_else(|| match &gitlab.host {
+                    Some(host) => format!("gitlab:{host}/{}", gitlab.project),
+                    None => format!("gitlab:{}", gitlab.project),
+                }),
                 project: gitlab.project.clone(),
                 title: gitlab.title.clone(),
                 branch: gitlab.branch.clone(),
@@ -749,6 +768,77 @@ mod tests {
             "#;
         let config = knuffel::parse::<Config>("test.kdl", text).unwrap();
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn gitlab_default_id_includes_host() {
+        // The same project path on two servers must resolve to distinct
+        // ids, or their snapshots would overwrite each other.
+        let config = parse_config(
+            r#"
+            panel "top" {
+                modules {
+                    gitlab project="raven/fw" host="gitlab.a.example"
+                    gitlab project="raven/fw" host="gitlab.b.example"
+                    gitlab project="group/app"
+                }
+            }
+            "#,
+        );
+        let modules = &config.panel_specs()[0].modules;
+        assert_eq!(modules[0].id(), "gitlab:gitlab.a.example/raven/fw");
+        assert_eq!(modules[1].id(), "gitlab:gitlab.b.example/raven/fw");
+        assert_eq!(modules[2].id(), "gitlab:group/app");
+    }
+
+    #[test]
+    fn duplicate_module_ids_in_panel_are_rejected() {
+        let text = r#"
+            panel "top" {
+                modules {
+                    gitlab project="raven/fw"
+                    gitlab project="raven/fw"
+                }
+            }
+            "#;
+        let config = knuffel::parse::<Config>("test.kdl", text).unwrap();
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("duplicate module id"),
+            "unexpected error {err:?}"
+        );
+
+        // The same id in different panels is fine: snapshots are keyed by
+        // (panel, module id).
+        parse_config(
+            r#"
+            panel "top" {
+                modules { gitlab project="raven/fw"; }
+            }
+            panel "bottom" {
+                anchor "bottom"
+                modules { gitlab project="raven/fw"; }
+            }
+            "#,
+        );
+    }
+
+    #[test]
+    fn duplicate_panel_ids_are_rejected() {
+        let text = r#"
+            panel "top" {
+                modules { clock; }
+            }
+            panel "top" {
+                modules { clock; }
+            }
+            "#;
+        let config = knuffel::parse::<Config>("test.kdl", text).unwrap();
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("duplicate panel id"),
+            "unexpected error {err:?}"
+        );
     }
 
     fn parse_config(text: &str) -> Config {

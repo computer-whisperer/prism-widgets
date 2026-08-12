@@ -797,6 +797,7 @@ fn parse_github_runs(spec: &GitHubSpec, text: &str) -> Option<ModuleSnapshot> {
         (None, Some(branch)) => Some(branch.to_string()),
         (None, None) => None,
     };
+    let detail = detail_with_age(detail, json_age(run, "updated_at"));
 
     Some(ModuleSnapshot {
         id: spec.id.clone(),
@@ -879,6 +880,7 @@ fn parse_gitlab_pipelines(spec: &GitLabSpec, text: &str) -> Option<ModuleSnapsho
         (None, Some(branch)) => Some(branch.to_string()),
         (None, None) => None,
     };
+    let detail = detail_with_age(detail, json_age(pipeline, "updated_at"));
 
     Some(ModuleSnapshot {
         id: spec.id.clone(),
@@ -896,6 +898,50 @@ fn parse_gitlab_pipelines(spec: &GitLabSpec, text: &str) -> Option<ModuleSnapsho
 /// separators need escaping.
 fn encode_project_path(project: &str) -> String {
     project.replace('/', "%2F")
+}
+
+/// Age suffix for a CI result's RFC 3339 timestamp field: `Some("3h ago")`,
+/// or `None` when the field is absent or unparsable.
+fn json_age(value: &Value, field: &str) -> Option<String> {
+    let raw = value.get(field)?.as_str()?;
+    let then = chrono::DateTime::parse_from_rfc3339(raw).ok()?;
+    Some(format_age(
+        then.with_timezone(&chrono::Utc),
+        chrono::Utc::now(),
+    ))
+}
+
+/// Compact "how long ago" for CI results, so a weeks-old failure reads
+/// differently from one that just happened: "just now", "5m ago", "3h ago",
+/// "2d ago", "6w ago", "3mo ago", "2y ago".
+fn format_age(then: chrono::DateTime<chrono::Utc>, now: chrono::DateTime<chrono::Utc>) -> String {
+    let minutes = (now - then).num_seconds().max(0) / 60;
+    let hours = minutes / 60;
+    let days = hours / 24;
+    if minutes < 1 {
+        "just now".to_string()
+    } else if minutes < 60 {
+        format!("{minutes}m ago")
+    } else if hours < 24 {
+        format!("{hours}h ago")
+    } else if days < 14 {
+        format!("{days}d ago")
+    } else if days < 61 {
+        format!("{}w ago", days / 7)
+    } else if days < 730 {
+        format!("{}mo ago", days / 30)
+    } else {
+        format!("{}y ago", days / 365)
+    }
+}
+
+/// Append an age suffix to a CI detail line: `push @ main` becomes
+/// `push @ main · 6w ago`. Either half may be absent.
+fn detail_with_age(detail: Option<String>, age: Option<String>) -> Option<String> {
+    match (detail, age) {
+        (Some(detail), Some(age)) => Some(format!("{detail} · {age}")),
+        (detail, age) => detail.or(age),
+    }
 }
 
 fn statuspage_snapshot(spec: &StatusPageSpec) -> ModuleSnapshot {
@@ -2096,6 +2142,62 @@ mod tests {
         let text = r#"[{"id": 7, "status": "failed", "ref": "dev", "source": "schedule"}]"#;
         let snap = parse_gitlab_pipelines(&gitlab_spec(), text).unwrap();
         assert_eq!(snap.status, ModuleStatus::Critical);
+    }
+
+    #[test]
+    fn format_age_tiers() {
+        use chrono::{TimeZone, Utc};
+        let now = Utc.with_ymd_and_hms(2026, 8, 12, 12, 0, 0).unwrap();
+        let age = |secs: i64| format_age(now - chrono::Duration::seconds(secs), now);
+        assert_eq!(age(30), "just now");
+        assert_eq!(age(5 * 60), "5m ago");
+        assert_eq!(age(3 * 3600), "3h ago");
+        assert_eq!(age(2 * 86_400), "2d ago");
+        assert_eq!(age(47 * 86_400), "6w ago");
+        assert_eq!(age(200 * 86_400), "6mo ago");
+        assert_eq!(age(3 * 365 * 86_400), "3y ago");
+        // A slightly-future timestamp (clock skew) clamps instead of panicking.
+        assert_eq!(age(-30), "just now");
+    }
+
+    /// The age is computed against the real clock, so tests pin only the
+    /// stable prefix and the " ago" suffix, not the exact count.
+    fn assert_detail_with_age(snap: &ModuleSnapshot, prefix: &str) {
+        match &snap.value {
+            ModuleValue::State { detail, .. } => {
+                let detail = detail.as_deref().expect("detail present");
+                assert!(detail.starts_with(prefix), "unexpected detail {detail:?}");
+                assert!(detail.ends_with(" ago"), "unexpected detail {detail:?}");
+            }
+            other => panic!("expected State, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gitlab_detail_includes_pipeline_age() {
+        let text = r#"[{"id": 7, "status": "failed", "ref": "main", "source": "push",
+                        "updated_at": "2026-06-26T21:00:11.567Z"}]"#;
+        let snap = parse_gitlab_pipelines(&gitlab_spec(), text).unwrap();
+        assert_detail_with_age(&snap, "push @ main · ");
+    }
+
+    #[test]
+    fn github_detail_includes_run_age() {
+        let spec = GitHubSpec {
+            id: "ci".into(),
+            repo: "owner/repo".into(),
+            title: None,
+            branch: None,
+            workflow: None,
+            interval: Duration::from_secs(60),
+            token_env: None,
+        };
+        let text = r#"{"workflow_runs": [{"name": "CI", "head_branch": "main",
+                        "status": "completed", "conclusion": "failure",
+                        "updated_at": "2026-06-26T21:00:11Z"}]}"#;
+        let snap = parse_github_runs(&spec, text).unwrap();
+        assert_eq!(snap.status, ModuleStatus::Critical);
+        assert_detail_with_age(&snap, "CI @ main · ");
     }
 
     #[test]
