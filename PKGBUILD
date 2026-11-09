@@ -29,7 +29,7 @@ makedepends=('cargo')
 # Rust link step.
 options=('!lto')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('SKIP')
+sha256sums=('d3c55ae5e01d2043c4fd715f89dbe457bec647f9b402d81510be460f1caaabbc')
 
 prepare() {
     cd "$pkgname-$pkgver"
