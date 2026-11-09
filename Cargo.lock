@@ -1650,7 +1650,7 @@ checksum = "e8cf8e6a8aa66ce33f63993ffc4ea4271eb5b0530a9002db8455ea6050c77bfa"
 
 [[package]]
 name = "prism-widgets"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1665,14 +1665,14 @@ dependencies = [
 
 [[package]]
 name = "prism-widgets-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
 ]
 
 [[package]]
 name = "prism-widgets-host"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "damascene-core",
@@ -1691,7 +1691,7 @@ dependencies = [
 
 [[package]]
 name = "prism-widgets-providers"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -1709,7 +1709,7 @@ dependencies = [
 
 [[package]]
 name = "prism-widgets-ui"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "damascene-core",
  "prism-widgets-core",

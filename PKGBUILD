@@ -1,7 +1,7 @@
 # Maintainer: Christian Balcom <robot.inventor@gmail.com>
 
 pkgname=prism-widgets
-pkgver=0.1.0
+pkgver=0.2.0
 pkgrel=1
 pkgdesc='Configurable Damascene layer-shell information panels for Wayland status surfaces'
 arch=('x86_64')
@@ -29,7 +29,7 @@ makedepends=('cargo')
 # Rust link step.
 options=('!lto')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('0a56b4e0bb9a533d908bd782b26259b799b92e2e54e6803bfb2fc71ee4ccd4c6')
+sha256sums=('SKIP')
 
 prepare() {
     cd "$pkgname-$pkgver"
