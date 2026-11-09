@@ -1934,12 +1934,22 @@ fn format_codex_credits(credits: &CodexUsageCredits) -> Option<String> {
     if credits.unlimited {
         Some("credits unlimited".into())
     } else if let Some(balance) = &credits.balance {
-        Some(format!("credits {balance}"))
+        Some(format!("credits {}", trim_decimal_zeros(balance)))
     } else if credits.has_credits {
         Some("credits enabled".into())
     } else {
         None
     }
+}
+
+/// Drop insignificant trailing zeros from a decimal string: the API reports
+/// balances like `62500.0000000000`. Non-numeric text passes through.
+fn trim_decimal_zeros(text: &str) -> &str {
+    let numeric = text.contains('.') && text.bytes().all(|b| b.is_ascii_digit() || b == b'.');
+    if !numeric {
+        return text;
+    }
+    text.trim_end_matches('0').trim_end_matches('.')
 }
 
 fn expand_home(path: &str) -> Result<PathBuf, String> {
@@ -2546,5 +2556,14 @@ mod tests {
             parse_chatgpt_account_id(&dotted_id_token).as_deref(),
             Some("acc-456")
         );
+    }
+
+    #[test]
+    fn credit_balances_drop_insignificant_zeros() {
+        assert_eq!(trim_decimal_zeros("62500.0000000000"), "62500");
+        assert_eq!(trim_decimal_zeros("9.990"), "9.99");
+        assert_eq!(trim_decimal_zeros("100"), "100");
+        assert_eq!(trim_decimal_zeros("0.0"), "0");
+        assert_eq!(trim_decimal_zeros("n/a 1.0"), "n/a 1.0");
     }
 }

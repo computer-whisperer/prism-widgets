@@ -1,7 +1,7 @@
 //! Provider-free host abstractions.
 //!
-//! This crate is where the `prism-bar`/`prism-widgets` common runner can
-//! eventually live. Keep application integrations out of this crate: no
+//! The layer-shell runner, written so it could later be shared with
+//! `prism-bar`. Keep application integrations out of this crate: no
 //! GitHub, no subscription APIs, no command-specific parsing.
 
 use std::collections::HashMap;
@@ -92,13 +92,6 @@ impl HostConfig {
     pub fn panel_ids(&self) -> impl Iterator<Item = &PanelId> {
         self.panels.iter().map(|panel| &panel.id)
     }
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum HostEvent {
-    PanelSnapshot(PanelSnapshot),
-    ConfigReloaded(HostConfig),
-    Quit,
 }
 
 pub trait PanelDataSource {
@@ -236,14 +229,11 @@ impl PanelRunner {
     }
 }
 
-/// Run configured panels as `wlr-layer-shell` surfaces.
+/// Run configured panels as `wlr-layer-shell` surfaces, reloading the
+/// config through `reloader` when one is given.
 ///
-/// This is intentionally provider-free: callers supply a data source,
+/// This is intentionally provider-free: callers supply a provider spawner,
 /// and this host only turns panel specs plus snapshots into surfaces.
-pub fn run_layer_shell(config: HostConfig, spawner: ProviderSpawner) -> Result<()> {
-    run_layer_shell_with_reload(config, spawner, None)
-}
-
 pub fn run_layer_shell_with_reload(
     config: HostConfig,
     spawner: ProviderSpawner,

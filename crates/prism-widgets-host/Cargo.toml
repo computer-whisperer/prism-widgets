@@ -19,6 +19,9 @@ raw-window-handle.workspace = true
 rustix.workspace = true
 smithay-client-toolkit.workspace = true
 tracing.workspace = true
+# Not imported: present for its `client_system` feature, which makes
+# wayland-client use the system libwayland so the host can hand raw
+# `wl_display`/`wl_surface` pointers to wgpu.
 wayland-backend.workspace = true
 wayland-client.workspace = true
 wgpu.workspace = true

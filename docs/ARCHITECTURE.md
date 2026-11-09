@@ -12,7 +12,7 @@
 - provider snapshots
 - status/freshness metadata
 
-`prism-widgets-host` should stay provider-free. Its eventual job is:
+`prism-widgets-host` stays provider-free. It owns:
 
 - Wayland registry/output/seat handling
 - `wlr-layer-shell` surface lifecycle
@@ -58,6 +58,18 @@ under a 64 MiB rolling budget that evicts oldest image entries first.
 `examples/clipboard-tool.rs` exercises the same protocol from the other side
 (get/set/set-image/clear) for end-to-end testing without wl-clipboard.
 
+Each provider generation carries an `epoch`. On config reload the host drops
+the old `SchedulerHandle` (signalling its workers to stop), bumps the epoch,
+and spawns a fresh generation; snapshots from workers still mid-fetch arrive
+with the retired epoch and are ignored. The host repaints a surface only when
+the display-relevant projection of its snapshots changes, so an unchanged
+GitHub status or a clock whose minute has not advanced costs no GPU work.
+
+`prism-widgets-host` stays provider-free: it knows only the `ProviderSpawner`
+closure, the opaque `ProviderHandle` it drops to stop a generation, and the
+`ModuleUpdate`s that arrive. The `--dry-run` path bypasses all of this and
+fetches once synchronously via `SnapshotStore`.
+
 ## Input and Actions
 
 The host binds the first seat's pointer (`SeatState`; the
@@ -71,8 +83,8 @@ direction of the snapshot channel, equally opaque to the host.
 
 Clipboard restore is the first consumer: clicking a history row routes an
 `ActivateEntry` to the watcher (via an mpsc channel plus a wake pipe that
-interrupts its poll), which re-owns the selection with that entry's text and
-promotes the entry when the compositor echoes the selection back — the echo,
+interrupts its poll), which re-owns the selection with that entry's payload (text, file
+list, or image) and promotes the entry when the compositor echoes the selection back — the echo,
 not the click, is the source of truth for history order. While serving, the
 watcher skips reading its own offers (a self-read would deadlock against its
 own `Send` handler). Known limitation: a config reload (or exit) while the
@@ -82,18 +94,6 @@ clipboard — selection ownership does not hand over across generations.
 Not yet wired: keyboard (layer surfaces keep `KeyboardInteractivity::None`),
 cursor shape (the compositor default shows over panels), touch, and Axis
 (scroll) events — dropped until something scrolls.
-
-Each provider generation carries an `epoch`. On config reload the host drops
-the old `SchedulerHandle` (signalling its workers to stop), bumps the epoch,
-and spawns a fresh generation; snapshots from workers still mid-fetch arrive
-with the retired epoch and are ignored. The host repaints a surface only when
-the display-relevant projection of its snapshots changes, so an unchanged
-GitHub status or a clock whose minute has not advanced costs no GPU work.
-
-`prism-widgets-host` stays provider-free: it knows only the `ProviderSpawner`
-closure, the opaque `ProviderHandle` it drops to stop a generation, and the
-`ModuleUpdate`s that arrive. The `--dry-run` path bypasses all of this and
-fetches once synchronously via `SnapshotStore`.
 
 ## Remaining Work
 

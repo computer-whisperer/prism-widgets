@@ -103,6 +103,15 @@ token the API isn't currently reporting is skipped rather than shown empty:
 usage source="claude" claude-dir="~/.claude" windows="5h 7d fable" interval=300
 ```
 
+To query a different endpoint with an API key instead of the OAuth
+credentials, set `base-url` (the widget appends `/api/oauth/usage`) together
+with `api-key-env`, the name of an environment variable holding the key, sent
+as `x-api-key`. `base-url` without `api-key-env` is an error:
+
+```kdl
+usage source="claude" base-url="https://usage.example.com" api-key-env="USAGE_API_KEY" interval=300
+```
+
 `usage source="codex"` reads Codex CLI auth from `$HOME/.codex/auth.json` by
 default. It refreshes the OAuth access token when needed, then calls
 ChatGPT's `/backend-api/wham/usage` endpoint using the same subscription auth
@@ -119,6 +128,7 @@ Any other `usage` source uses the `SOURCE-usage-json` helper convention. A
 `source` containing whitespace is treated as the full command. `github` uses
 `gh api` and maps the latest Actions run into a status.
 `workflow=` accepts a workflow file/ID or filters recent runs by display name.
+`token-env=` names an env var exported to `gh` as `GH_TOKEN`.
 `title=` overrides the displayed label, so a long `owner/name` repo can show
 as a short name instead of being ellipsized in a sidebar.
 
@@ -161,6 +171,17 @@ the 1-minute load average as a percentage of core count (over 100% means the
 machine is oversubscribed). `gpu` reads one `amdgpu` DRM card per module
 (`card=` is the `/sys/class/drm/cardN` index); the power meter is omitted on
 cards that do not expose a draw and cap, such as integrated parts.
+
+`clipboard` keeps a rolling history of the Wayland clipboard, newest first,
+observed through `ext-data-control` (the compositor must support it). It
+records text, file lists, and images (shown with thumbnails); clicking an
+entry copies it again. Selections flagged with `x-kde-passwordManagerHint`
+(password managers) are never stored. `max-entries=` sets the history length
+(default 8):
+
+```kdl
+clipboard max-entries=8
+```
 
 ## Running
 

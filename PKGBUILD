@@ -16,9 +16,11 @@ depends=(
     'wayland'
 )
 # Optional runtime helpers, invoked only when the matching module is
-# configured: `gh` for the github module, `sh` for command modules.
+# configured: `gh` for the github module, `glab` for the gitlab module, `sh`
+# for command modules.
 optdepends=(
     'github-cli: github module status via `gh api`'
+    'glab: gitlab module status via `glab api`'
 )
 makedepends=('cargo')
 # Disable system LTO — Arch's default `-flto=auto` lands in CFLAGS and makes
